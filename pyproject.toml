@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastmcp",
     "httpx[http2]",
+    "httpcore>=1.0,<1.1",
     "pydantic-settings",
     "selectolax",
     "trafilatura",
@@ -21,6 +22,7 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-asyncio",
+    "cryptography",
     "ruff",
     "mypy",
 ]
@@ -36,6 +38,9 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "-ra"
+# weft/__init__.py filters this for real runs, but pytest drops filters installed while it loads
+# conftest, which now imports weft.
+filterwarnings = ["ignore:SOCKS support in urllib3"]
 
 [tool.ruff]
 line-length = 100
@@ -46,7 +51,8 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "B", "UP", "ASYNC", "S", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S105", "S106"]
+# S104 flags "0.0.0.0" as a bind address; in the SSRF tests it is an address under test.
+"tests/**" = ["S101", "S104", "S105", "S106"]
 
 [tool.mypy]
 python_version = "3.12"

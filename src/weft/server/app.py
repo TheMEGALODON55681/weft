@@ -13,7 +13,8 @@ from pydantic import Field
 
 from weft.config import Settings
 from weft.db import Database
-from weft.fetch.http import Fetcher, FetchError
+from weft.fetch.errors import FetchError
+from weft.fetch.http import Fetcher
 from weft.fetch.page import RenderMode, get_page
 from weft.models import PageResult
 
@@ -69,8 +70,12 @@ def build_server(settings: Settings) -> FastMCP:
     ) -> PageResult:
         """Fetch one page and return its main content as Markdown, plus title, metadata,
         links, HTTP status, the final URL after redirects, and which fetch method was used.
-        HTTP error statuses are returned as results; only unusable responses (bad URL,
-        timeout, non-HTML content, redirect loop) raise an error with a stable code prefix."""
+        HTTP error statuses are returned as results. Weft obeys robots.txt, spaces its requests
+        to each host, retries transient failures and refuses private and loopback addresses, so
+        it can decline a fetch. Declined and unusable fetches (bad URL, timeout, non-HTML
+        content, redirect loop, robots_disallowed, blocked_address, rate_limited, circuit_open)
+        raise an error whose message starts with a stable code. Do not retry robots_disallowed
+        or blocked_address. rate_limited and circuit_open say how long to wait."""
         state: AppState = ctx.lifespan_context["state"]
         try:
             return await get_page(state.fetcher, state.settings, url, render)

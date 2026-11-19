@@ -1,8 +1,13 @@
+import asyncio
+import threading
+import time
+
 import pytest
 
 from fixture_site import FixtureSite
 from weft.config import Settings
-from weft.fetch.http import Fetcher, FetchError
+from weft.fetch.errors import FetchError
+from weft.fetch.http import Fetcher
 from weft.fetch.page import get_page
 
 
@@ -96,6 +101,59 @@ async def test_markdown_cap_is_surfaced(page_of) -> None:
 @pytest.mark.parametrize("mode", ["auto", "never"])
 async def test_http_only_modes_fetch_over_http(mode: str, page_of) -> None:
     assert (await page_of("/article", render=mode)).fetch_method == "http"
+
+
+async def test_extraction_that_overruns_is_cut_off(
+    site: FixtureSite, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = threading.Event()
+
+    def hung(*_args: object) -> None:
+        release.wait(10)
+
+    monkeypatch.setattr("weft.fetch.page.extract_page", hung)
+    settings = Settings(extract_timeout_s=0.2)
+    fetcher = Fetcher(settings)
+    try:
+        start = time.perf_counter()
+        with pytest.raises(FetchError) as e:
+            await get_page(fetcher, settings, site.url("/article"))
+        elapsed = time.perf_counter() - start
+    finally:
+        release.set()  # the thread cannot be cancelled, only let go; do not leave it behind
+        await fetcher.aclose()
+    assert e.value.code == "extraction_timeout"
+    assert elapsed < 1.0  # the caller is freed while the thread is still stuck
+
+
+async def test_extraction_runs_in_a_small_pool_of_its_own(
+    site: FixtureSite, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock, running, peak = threading.Lock(), 0, 0
+
+    def slow(*_args: object) -> None:
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        time.sleep(0.4)
+        with lock:
+            running -= 1
+        raise ValueError  # any outcome will do; only the overlap matters
+
+    monkeypatch.setattr("weft.fetch.page.extract_page", slow)
+    settings = Settings(host_concurrency=8)
+    fetcher = Fetcher(settings)
+    try:
+        await asyncio.gather(
+            *(get_page(fetcher, settings, site.url("/article")) for _ in range(8)),
+            return_exceptions=True,
+        )
+    finally:
+        await fetcher.aclose()
+    # At most four at once, however many pages are waiting. Not exactly four: a thread released
+    # by an earlier test can still be winding down.
+    assert 2 <= peak <= 4
 
 
 async def test_forced_rendering_says_it_is_unavailable(page_of) -> None:

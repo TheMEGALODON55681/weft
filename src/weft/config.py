@@ -38,6 +38,26 @@ class Settings(BaseSettings):
     # Caps on what a single fetch_page call hands back to the agent.
     max_links: int = Field(default=200, gt=0)
     max_content_chars: int = Field(default=100_000, gt=0)
+    # Decoding and extraction run in a worker thread that cannot be interrupted, so this frees the
+    # caller, not the thread.
+    extract_timeout_s: float = Field(default=10.0, gt=0)
+
+    # SSRF guard. Private, link-local, metadata and other non-public addresses are always refused.
+    # Loopback is refused too unless this is set; leave it off outside local development.
+    allow_loopback: bool = False
+
+    # Politeness. Limits are per host name, apart from the global cap. A robots.txt Crawl-delay
+    # raises the interval for that host. 0 turns the interval off.
+    host_min_interval_s: float = Field(default=1.0, ge=0)
+    host_concurrency: int = Field(default=2, gt=0)
+    global_concurrency: int = Field(default=16, gt=0)
+
+    # Resilience. Retries cover transport errors and 429/502/503/504 responses. The breaker opens
+    # for a host after this many consecutive failures, stays open for 30 s, then lets one probe
+    # through.
+    max_retries: int = Field(default=2, ge=0)
+    retry_backoff_s: float = Field(default=0.5, ge=0)
+    breaker_threshold: int = Field(default=5, gt=0)
 
     @property
     def db_path(self) -> Path:

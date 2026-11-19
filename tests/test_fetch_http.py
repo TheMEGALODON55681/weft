@@ -3,22 +3,7 @@ import socket
 import pytest
 
 from fixture_site import FixtureSite
-from weft.config import Settings
-from weft.fetch.http import Fetcher, FetchError
-
-
-@pytest.fixture
-async def fetch_with(site: FixtureSite):
-    opened: list[Fetcher] = []
-
-    def make(**overrides: object) -> Fetcher:
-        f = Fetcher(Settings(**overrides))
-        opened.append(f)
-        return f
-
-    yield make
-    for f in opened:
-        await f.aclose()
+from weft.fetch.errors import FetchError
 
 
 async def test_plain_fetch(site: FixtureSite, fetch_with) -> None:
@@ -109,7 +94,8 @@ async def test_connection_refused_is_a_network_error(fetch_with) -> None:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     with pytest.raises(FetchError) as e:
-        await fetch_with().fetch(f"http://127.0.0.1:{port}/")
+        # No retries: this is about the error code, and Windows takes ~2 s to refuse a connection.
+        await fetch_with(max_retries=0).fetch(f"http://127.0.0.1:{port}/")
     assert e.value.code == "network_error"
 
 

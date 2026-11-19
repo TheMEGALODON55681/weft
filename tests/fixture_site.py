@@ -6,11 +6,21 @@ bad encodings) stays visible in one place.
 """
 
 import gzip
+import ssl
 import threading
 import time
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import cast
+from urllib.parse import parse_qs, urlsplit
+
+DEFAULT_ROBOTS = """User-agent: *
+Disallow: /private/
+Allow: /private/open
+Disallow: /*.pdf$
+"""
 
 ARTICLE_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -105,6 +115,60 @@ def _endless(h: BaseHTTPRequestHandler) -> None:
     _redirect(h, f"/endless/{n + 1}")
 
 
+def _state(h: BaseHTTPRequestHandler) -> "_Server":
+    return cast("_Server", h.server)
+
+
+def _robots(h: BaseHTTPRequestHandler) -> None:
+    body = _state(h).robots
+    if body is None:
+        _send(h, b"not found", status=404, ctype="text/plain")
+    elif isinstance(body, int):
+        _send(h, b"unavailable", status=body, ctype="text/plain")
+    else:
+        _send(h, body.encode(), ctype="text/plain")
+
+
+def _flaky(h: BaseHTTPRequestHandler) -> None:
+    """/flaky/<key>/<n>?s=503&ra=1: fail the first n requests for <key>, then serve the article."""
+    st = _state(h)
+    key, n = urlsplit(h.path).path.split("/")[2:4]
+    query = parse_qs(urlsplit(h.path).query)
+    with st.lock:
+        st.flaky[key] += 1
+        seen = st.flaky[key]
+    if seen > int(n):
+        _article(h)
+        return
+    retry_after = {"Retry-After": query["ra"][0]} if "ra" in query else None
+    _send(h, b"try later", int(query.get("s", ["503"])[0]), "text/plain", retry_after)
+
+
+def _reset(h: BaseHTTPRequestHandler) -> None:
+    """/reset/<key>/<n>: drop the connection without a response for the first n requests."""
+    st = _state(h)
+    key, n = urlsplit(h.path).path.split("/")[2:4]
+    with st.lock:
+        st.flaky[key] += 1
+        seen = st.flaky[key]
+    if seen > int(n):
+        _article(h)
+
+
+def _hold(h: BaseHTTPRequestHandler) -> None:
+    """Answer after 0.3 s, recording how many requests were in flight at once."""
+    st = _state(h)
+    with st.lock:
+        st.active += 1
+        st.peak = max(st.peak, st.active)
+    try:
+        time.sleep(0.3)
+    finally:
+        with st.lock:
+            st.active -= 1
+    _send(h, b"<html><title>held</title></html>")
+
+
 ROUTES: dict[str, Callable[[BaseHTTPRequestHandler], None]] = {
     "/": lambda h: _send(h, b'<html><title>Home</title><a href="/article">a</a></html>'),
     "/article": _article,
@@ -114,6 +178,10 @@ ROUTES: dict[str, Callable[[BaseHTTPRequestHandler], None]] = {
     "/loop/a": lambda h: _redirect(h, "/loop/b"),
     "/loop/b": lambda h: _redirect(h, "/loop/a"),
     "/redirect-to-file": lambda h: _redirect(h, "file:///etc/passwd"),
+    "/redirect-to-metadata": lambda h: _redirect(h, "http://169.254.169.254/latest/meta-data/"),
+    "/redirect-to-private": lambda h: _redirect(h, "http://10.0.0.1/admin"),
+    "/redirect-to-mapped": lambda h: _redirect(h, "http://[::ffff:a00:1]/"),
+    "/redirect-to-disallowed": lambda h: _redirect(h, "/private/secret"),
     "/redirect-no-location": lambda h: _send(h, status=302),
     "/big": lambda h: _send(h, b"<html><body>" + b"a" * 200_000 + b"</body></html>"),
     "/bomb": lambda h: _send(h, _GZIP_BOMB, headers={"Content-Encoding": "gzip"}),
@@ -139,13 +207,25 @@ ROUTES: dict[str, Callable[[BaseHTTPRequestHandler], None]] = {
     "/slow": _slow,
     "/drip": _drip,
     "/ua": _ua,
+    "/robots.txt": _robots,
+    "/ping": lambda h: _send(h, b"<html><title>pong</title></html>"),
+    "/hold": _hold,
 }
-PREFIX_ROUTES: dict[str, Callable[[BaseHTTPRequestHandler], None]] = {"/endless/": _endless}
+PREFIX_ROUTES: dict[str, Callable[[BaseHTTPRequestHandler], None]] = {
+    "/endless/": _endless,
+    "/flaky/": _flaky,
+    "/reset/": _reset,
+    "/private/": lambda h: _send(h, b"<html><title>private</title></html>"),
+}
 
 
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
+        st = _state(self)
+        with st.lock:
+            st.hits[path] += 1
+            st.times[path].append(time.monotonic())
         handler = ROUTES.get(path)
         if handler is None:
             handler = next((f for p, f in PREFIX_ROUTES.items() if path.startswith(p)), None)
@@ -158,23 +238,58 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
+class _Server(ThreadingHTTPServer):
+    """The server plus what the handlers record. `robots` is the body of /robots.txt, an HTTP
+    status to answer it with, or None for a 404."""
+
+    def __init__(self, robots: str | int | None) -> None:
+        super().__init__(("127.0.0.1", 0), _Handler)
+        self.daemon_threads = True
+        self.robots = robots
+        self.lock = threading.Lock()
+        self.hits: Counter[str] = Counter()
+        self.times: defaultdict[str, list[float]] = defaultdict(list)
+        self.flaky: Counter[str] = Counter()
+        self.active = 0
+        self.peak = 0
+
+    def handle_error(self, request: object, client_address: object) -> None:
+        pass  # a client that rejects our certificate is a test, not a traceback
+
+
 class FixtureSite:
-    def __init__(self, server: ThreadingHTTPServer) -> None:
+    def __init__(self, server: _Server, https: bool = False) -> None:
         self._server = server
-        self.base = f"http://127.0.0.1:{server.server_address[1]}"
+        self.base = f"{'https' if https else 'http'}://127.0.0.1:{server.server_address[1]}"
 
     def url(self, path: str) -> str:
         return self.base + path
 
+    def hits(self, path: str) -> int:
+        """Requests received for `path` (query string ignored)."""
+        return self._server.hits[path]
+
+    def times(self, path: str) -> list[float]:
+        """time.monotonic() at each request for `path`."""
+        return list(self._server.times[path])
+
+    @property
+    def peak(self) -> int:
+        """Most /hold requests ever in flight at once."""
+        return self._server.peak
+
 
 @contextmanager
-def run_site() -> Iterator[FixtureSite]:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-    server.daemon_threads = True
+def run_site(
+    robots: str | int | None = DEFAULT_ROBOTS, tls: ssl.SSLContext | None = None
+) -> Iterator[FixtureSite]:
+    server = _Server(robots)
+    if tls:
+        server.socket = tls.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield FixtureSite(server)
+        yield FixtureSite(server, https=tls is not None)
     finally:
         server.shutdown()
         server.server_close()

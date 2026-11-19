@@ -71,7 +71,13 @@ async def test_real_stdio_transport_round_trip(site: FixtureSite, tmp_path: Path
     transport = StdioTransport(
         command=sys.executable,
         args=["-m", "weft"],
-        env={"WEFT_DATA_DIR": str(tmp_path / "data"), "WEFT_LOG_LEVEL": "INFO"},
+        env={
+            "WEFT_DATA_DIR": str(tmp_path / "data"),
+            "WEFT_LOG_LEVEL": "INFO",
+            # The child gets a minimal environment, not the test's; it must reach the loopback site.
+            "WEFT_ALLOW_LOOPBACK": "1",
+            "WEFT_HOST_MIN_INTERVAL_S": "0",
+        },
         keep_alive=False,
     )
     async with Client(transport) as client:
