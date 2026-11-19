@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "weft"
+version = "0.1.0"
+description = "Goal-directed web crawler and in-site search, served to AI agents over MCP."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp",
+    "httpx[http2]",
+    "pydantic-settings",
+    "selectolax",
+    "trafilatura",
+    "charset-normalizer",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+weft = "weft.server.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/weft"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "S", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/weft"]
+strict = true
+
+[tool.ruff.lint.flake8-bugbear]
+# CurrentContext() is a dependency-injection marker, evaluated once at definition time on purpose.
+extend-immutable-calls = ["fastmcp.dependencies.CurrentContext"]
+
+[tool.ruff.format]
+line-ending = "lf"
