@@ -53,6 +53,16 @@ the <a href="https://other.test/review" rel="nofollow">independent review</a>.</
 </body></html>
 """
 
+# Content exists only after the script runs. Over plain HTTP the page is an empty mount point.
+JS_SHELL_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Shell</title></head>
+<body><div id="root"></div>
+<script>
+document.getElementById("root").innerHTML = "<article><h1>Rendered report</h1><p>" +
+  "This paragraph was written by a script after the page loaded. ".repeat(12) + "</p></article>";
+</script></body></html>
+"""
+
 _GZIP_BOMB = gzip.compress(b"\0" * 20_000_000)
 _LATIN1_HTML = (
     "<html><head><title>Caf\xe9</title></head><body><p>cr\xe8me br\xfbl\xe9e</p></body></html>"
@@ -127,6 +137,11 @@ def _robots(h: BaseHTTPRequestHandler) -> None:
         _send(h, b"unavailable", status=body, ctype="text/plain")
     else:
         _send(h, body.encode(), ctype="text/plain")
+
+
+def _goto(h: BaseHTTPRequestHandler) -> None:
+    """/goto?u=<url>: redirect to a target the test chooses."""
+    _redirect(h, parse_qs(urlsplit(h.path).query)["u"][0])
 
 
 def _flaky(h: BaseHTTPRequestHandler) -> None:
@@ -210,6 +225,14 @@ ROUTES: dict[str, Callable[[BaseHTTPRequestHandler], None]] = {
     "/robots.txt": _robots,
     "/ping": lambda h: _send(h, b"<html><title>pong</title></html>"),
     "/hold": _hold,
+    "/js-shell": lambda h: _send(h, JS_SHELL_HTML.encode()),
+    "/goto": _goto,
+    "/script.js": lambda h: _send(h, b"window.loaded = true;", ctype="text/javascript"),
+    "/sw.js": lambda h: _send(h, b"self.oninstall = () => {};", ctype="text/javascript"),
+    "/echo-body": lambda h: _send(
+        h, h.rfile.read(int(h.headers.get("Content-Length") or 0)), ctype="text/plain"
+    ),
+    "/host": lambda h: _send(h, (h.headers.get("Host") or "").encode(), ctype="text/plain"),
 }
 PREFIX_ROUTES: dict[str, Callable[[BaseHTTPRequestHandler], None]] = {
     "/endless/": _endless,
@@ -233,6 +256,10 @@ class _Handler(BaseHTTPRequestHandler):
             _send(self, b"not found", status=404, ctype="text/plain")
         else:
             handler(self)
+
+    # Count every method, so a test that expects no contact at all also sees beacons (POST) and
+    # CORS preflights (OPTIONS).
+    do_POST = do_PUT = do_DELETE = do_OPTIONS = do_HEAD = do_GET
 
     def log_message(self, format: str, *args: object) -> None:
         pass
@@ -265,9 +292,22 @@ class FixtureSite:
     def url(self, path: str) -> str:
         return self.base + path
 
+    @property
+    def port(self) -> int:
+        return int(self._server.server_address[1])
+
+    @property
+    def total_hits(self) -> int:
+        """Requests received for any path."""
+        return sum(self._server.hits.values())
+
     def hits(self, path: str) -> int:
         """Requests received for `path` (query string ignored)."""
         return self._server.hits[path]
+
+    def hits_under(self, prefix: str) -> dict[str, int]:
+        """Paths starting with `prefix` that were requested, with their counts."""
+        return {p: n for p, n in self._server.hits.items() if p.startswith(prefix)}
 
     def times(self, path: str) -> list[float]:
         """time.monotonic() at each request for `path`."""

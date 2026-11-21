@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     retry_backoff_s: float = Field(default=0.5, ge=0)
     breaker_threshold: int = Field(default=5, gt=0)
 
+    # Rendering. render="auto" starts a headless browser only for a page that has scripts and
+    # fewer than render_min_words words of content, or asks for JavaScript in a <noscript>. The
+    # browser starts on first use and is replaced after browser_recycle_after pages. Each page's
+    # JavaScript heap is capped at browser_js_heap_mb; a page that exceeds it is killed.
+    render_min_words: int = Field(default=50, ge=0)
+    render_timeout_s: float = Field(default=20.0, gt=0)
+    browser_max_pages: int = Field(default=2, gt=0)
+    browser_recycle_after: int = Field(default=50, gt=0)
+    browser_js_heap_mb: int = Field(default=256, ge=16)
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "weft.db"

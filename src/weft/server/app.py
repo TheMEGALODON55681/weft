@@ -13,6 +13,7 @@ from pydantic import Field
 
 from weft.config import Settings
 from weft.db import Database
+from weft.fetch.browser import BrowserPool
 from weft.fetch.errors import FetchError
 from weft.fetch.http import Fetcher
 from weft.fetch.page import RenderMode, get_page
@@ -32,6 +33,7 @@ class AppState:
     settings: Settings
     db: Database
     fetcher: Fetcher
+    browser: BrowserPool
 
 
 def build_server(settings: Settings) -> FastMCP:
@@ -40,12 +42,14 @@ def build_server(settings: Settings) -> FastMCP:
         db = await Database.open(settings.db_path)
         try:
             fetcher = Fetcher(settings)
+            browser = BrowserPool(settings, fetcher)  # starts Chromium on first use only
             try:
                 log.info(
                     "ready", extra={"db": str(settings.db_path), "user_agent": settings.user_agent}
                 )
-                yield {"state": AppState(settings, db, fetcher)}
+                yield {"state": AppState(settings, db, fetcher, browser)}
             finally:
+                await browser.aclose()
                 await fetcher.aclose()
         finally:
             await db.close()
@@ -61,24 +65,28 @@ def build_server(settings: Settings) -> FastMCP:
             RenderMode,
             Field(
                 description=(
-                    "'never' and 'auto' fetch over plain HTTP. 'always' requests a headless "
-                    "browser, which this build does not have yet and reports as an error."
+                    "'auto' fetches over plain HTTP and renders in a headless browser only when "
+                    "the page is a JavaScript shell or its text is thin. 'never' skips the "
+                    "browser. 'always' renders every page, and fails with render_unavailable "
+                    "if the server has no browser."
                 )
             ),
         ] = "auto",
         ctx: Context = CurrentContext(),
     ) -> PageResult:
         """Fetch one page and return its main content as Markdown, plus title, metadata,
-        links, HTTP status, the final URL after redirects, and which fetch method was used.
+        links, HTTP status, the final URL after redirects, and which fetch method was used
+        ('http' or 'browser').
         HTTP error statuses are returned as results. Weft obeys robots.txt, spaces its requests
         to each host, retries transient failures and refuses private and loopback addresses, so
         it can decline a fetch. Declined and unusable fetches (bad URL, timeout, non-HTML
-        content, redirect loop, robots_disallowed, blocked_address, rate_limited, circuit_open)
+        content, redirect loop, robots_disallowed, blocked_address, rate_limited, circuit_open,
+        render_failed)
         raise an error whose message starts with a stable code. Do not retry robots_disallowed
         or blocked_address. rate_limited and circuit_open say how long to wait."""
         state: AppState = ctx.lifespan_context["state"]
         try:
-            return await get_page(state.fetcher, state.settings, url, render)
+            return await get_page(state.fetcher, state.settings, url, render, state.browser)
         except FetchError as exc:
             raise ToolError(f"{exc.code}: {exc}", log_level=logging.WARNING) from exc
 

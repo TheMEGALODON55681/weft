@@ -42,6 +42,7 @@ class FetchResult:
     truncated: bool
     redirects: list[str] = field(default_factory=list)  # every URL requested before final_url
     elapsed_ms: float = 0.0
+    location: str | None = None  # the absolute redirect target, when redirects were not followed
 
 
 def parse_http_url(raw: str) -> httpx.URL:
@@ -100,11 +101,13 @@ class Fetcher:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def fetch(self, raw_url: str) -> FetchResult:
+    async def fetch(self, raw_url: str, *, follow_redirects: bool = True) -> FetchResult:
+        """With `follow_redirects` off, a redirect comes back as a result carrying `location`, so
+        a browser can follow it itself and each hop still passes through here."""
         start = time.perf_counter()
         try:
             async with asyncio.timeout(self._total_timeout):
-                result = await self._fetch(raw_url, start)
+                result = await self._fetch(raw_url, start, follow=follow_redirects)
         except (FetchError, TimeoutError, httpx.RequestError) as exc:
             err = exc if isinstance(exc, FetchError) else _as_fetch_error(exc)
             log.warning("fetch failed", extra={"url": safe_url(raw_url), "code": err.code})
@@ -139,7 +142,9 @@ class Fetcher:
             )
         return rules.crawl_delay or 0.0
 
-    async def _fetch(self, raw_url: str, start: float, *, robots: bool = True) -> FetchResult:
+    async def _fetch(
+        self, raw_url: str, start: float, *, robots: bool = True, follow: bool = True
+    ) -> FetchResult:
         url = parse_http_url(raw_url)
         seen: set[str] = set()
         chain: list[str] = []
@@ -150,15 +155,18 @@ class Fetcher:
                 interval = max(self._interval, await self._check_robots(url))
             resp, body, truncated = await self._send(url, interval, start)
             location = resp.headers.get("location")
+            target = None
             if resp.status_code in _REDIRECT_STATUSES and location:
+                try:
+                    target = str(url.join(location))
+                except httpx.InvalidURL as exc:
+                    raise FetchError("invalid_url", f"bad redirect target: {exc}") from None
+            if target and follow:
                 if len(chain) >= self._max_redirects:
                     raise FetchError(
                         "too_many_redirects", f"more than {self._max_redirects} redirects"
                     )
-                try:
-                    nxt = parse_http_url(str(url.join(location)))
-                except httpx.InvalidURL as exc:
-                    raise FetchError("invalid_url", f"bad redirect target: {exc}") from None
+                nxt = parse_http_url(target)
                 if str(nxt.copy_with(fragment=None)) in seen:
                     raise FetchError("redirect_loop", "redirects lead back to a prior URL")
                 chain.append(str(url))
@@ -174,6 +182,7 @@ class Fetcher:
                 truncated=truncated,
                 redirects=chain,
                 elapsed_ms=(time.perf_counter() - start) * 1000,
+                location=target,
             )
 
     async def _send(

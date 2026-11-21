@@ -128,3 +128,20 @@ async def test_cookies_never_persist_between_fetches(site: FixtureSite, fetch_wi
     await fetcher.fetch(site.url("/set-cookie"))
     r = await fetcher.fetch(site.url("/echo-cookie"))
     assert r.body == b""
+
+
+async def test_one_hop_mode_returns_the_redirect_with_its_target(
+    site: FixtureSite, fetch_with
+) -> None:
+    before = site.hits("/article")
+    r = await fetch_with().fetch(site.url("/chain/1"), follow_redirects=False)
+    assert r.status == 301
+    assert r.location == site.url("/chain/2")  # made absolute
+    assert r.redirects == []
+    assert site.hits("/article") == before  # nothing past the first hop was requested
+
+
+async def test_one_hop_mode_still_checks_robots(site: FixtureSite, fetch_with) -> None:
+    with pytest.raises(FetchError) as e:
+        await fetch_with().fetch(site.url("/private/secret"), follow_redirects=False)
+    assert e.value.code == "robots_disallowed"

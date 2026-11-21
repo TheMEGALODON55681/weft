@@ -46,7 +46,6 @@ async def test_fetch_page_returns_structured_output(site: FixtureSite, settings:
         ({"url": "ftp://example.test/"}, "invalid_url"),
         ({"url": "/pdf"}, "unsupported_content_type"),
         ({"url": "/loop/a"}, "redirect_loop"),
-        ({"url": "/article", "render": "always"}, "render_unavailable"),
     ],
 )
 async def test_failures_are_tool_errors_with_a_stable_code(

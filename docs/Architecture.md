@@ -1,6 +1,6 @@
 # Architecture
 
-State as of Phase 2. Later phases add modules and tables; each phase updates this file.
+State as of Phase 3. Later phases add modules and tables; each phase updates this file.
 
 ## Layout
 
@@ -16,7 +16,9 @@ src/weft/
   fetch/robots.py  robots.txt parser, matcher and per-origin cache
   fetch/limits.py  per-host spacing and concurrency, global cap, circuit breaker
   fetch/retry.py   backoff with jitter, Retry-After parsing
-  fetch/page.py    get_page: fetch, decode, extract under a timeout, apply output caps
+  fetch/proxy.py   GuardedProxy: the local HTTP proxy Chromium is forced through
+  fetch/browser.py BrowserPool: headless Chromium, navigation routing, reuse and limits
+  fetch/page.py    get_page: fetch, decode, extract, render policy, output caps
   extract/decode.py   bytes to text for mislabelled or undeclared encodings
   extract/content.py  HTML to Markdown, title, metadata
   extract/links.py    outgoing links
@@ -30,8 +32,8 @@ Planned directories (`rank/`, `frontier/`, `jobs/`) appear with the phase that n
 
 ## Data flow: `fetch_page`
 
-1. The tool receives `url` and `render` from the MCP client. `server/app.py` pulls the shared state (settings, database, fetcher) from the server lifespan.
-2. `get_page` rejects `render="always"` with `render_unavailable`. No browser exists yet.
+1. The tool receives `url` and `render` from the MCP client. `server/app.py` pulls the shared state (settings, database, fetcher, browser pool) from the server lifespan. The pool starts nothing until a page needs it.
+2. Every mode starts with a plain fetch. The browser never fetches the document itself.
 3. `Fetcher.fetch` validates the URL, then runs everything below under one `asyncio.timeout(total_timeout_s)`. Waits for a host's turn, retries, backoff sleeps, robots.txt reads and redirects all spend from that one budget.
 4. The redirect loop in `Fetcher._fetch` handles each hop the same way:
    1. **robots.txt.** `RobotsCache.rules_for` returns the origin's cached rules, or reads `/robots.txt` on a miss. That read goes through steps b to e itself, with the robots check off and no spacing, so it gets the address guard, the breaker, the host's slots and retries. The hop is refused with `robots_disallowed` if the rules say so. The rules' `Crawl-delay` raises the spacing for this hop. The `/robots.txt` URL itself is never checked.
@@ -44,8 +46,10 @@ Planned directories (`rank/`, `frontier/`, `jobs/`) appear with the phase that n
 5. `get_page` refuses non-HTML content types. An absent `Content-Type` counts as HTML.
 6. Decoding and extraction run in a worker thread so the event loop stays free, under `extract_timeout_s`. The thread comes from a pool of four that belongs to extraction alone. A thread cannot be interrupted, so a timeout frees the caller with `extraction_timeout` and leaves the thread to finish. The separate pool keeps stuck pages from using up the default executor, which also runs DNS lookups. `decode_body` tries a byte-order mark, the header charset, a `<meta>` charset, UTF-8, statistical detection and, as a last resort, UTF-8 with replacement characters. It never raises.
 7. `extract_page` runs trafilatura for Markdown and metadata, and selectolax for links, `<title>`, `lang` and the canonical URL. A parser crash is logged and yields empty Markdown, not an exception.
-8. `get_page` applies `max_content_chars` and `max_links`, records the totals, and returns a `PageResult`.
-9. `server/app.py` converts any `FetchError` into an MCP tool error whose message starts with the error code. Anything else is logged with a traceback and reaches the client as a generic failure, with details masked.
+8. **Render policy.** With `render="never"`, or `"auto"` when `wants_render` says no, the HTTP extraction is the answer. `wants_render` runs in the same worker thread. It says yes only if the page has a `<script>` and either the extracted text is under `render_min_words` words or a `<noscript>` mentions JavaScript. A page without scripts cannot gain content from a browser. With `render="always"`, the HTTP extraction is skipped.
+9. **Rendering.** `BrowserPool.render` loads the fetched body in Chromium (see Rendering) and returns the serialised DOM and the page's final URL. That HTML goes through `extract_page` in the same pool and under the same timeout. In `"auto"` mode, any render failure is logged as `render skipped` and the HTTP extraction is returned. In `"always"` mode it is raised.
+10. `get_page` applies `max_content_chars` and `max_links`, records the totals, and returns a `PageResult`. `fetch_method` says which path produced the content. `elapsed_ms` covers the whole call.
+11. `server/app.py` converts any `FetchError` into an MCP tool error whose message starts with the error code. Anything else is logged with a traceback and reaches the client as a generic failure, with details masked.
 
 ## Error model
 
@@ -63,11 +67,36 @@ Which layer raises each code, and what the retry loop and breaker do with it:
 | `robots_unavailable` | `fetch/robots.py` | no | no, but the robots read behind it was retried and counted |
 | `rate_limited` | `fetch/limits.py` | no | no |
 | `circuit_open` | `fetch/limits.py` | no | no |
-| `unsupported_content_type`, `extraction_timeout`, `render_unavailable` | `fetch/page.py` | no | no |
+| `unsupported_content_type`, `extraction_timeout` | `fetch/page.py` | no | no |
+| `render_unavailable` | `fetch/browser.py` (Chromium missing or will not start, pool closed), `fetch/page.py` (no pool) | no | no |
+| `render_failed`, `timeout` from rendering | `fetch/browser.py` | no | no |
+
+The last two rows reach the caller only with `render="always"`. In `"auto"` mode they fall back to the HTTP result. A navigation that the Fetcher refuses inside a render does not fail the render: the browser sees a blocked request and the page carries on without it.
 
 Only transport failures are retried, because only they can pass by themselves. A refusal that depends on the request, such as a blocked address or a disallowed path, would give the same answer again. A temporary DNS failure (`EAI_AGAIN`) is the one resolver error treated as a transport failure.
 
 Errors from the robots.txt read itself (a timeout, a dead host, a blocked address, an open breaker) reach the caller unchanged and are not cached. They say nothing about the site's rules, and the page fetch would have failed the same way. Only an error status from a server that did answer becomes `robots_unavailable`.
+
+## Rendering
+
+`fetch/browser.py` holds one `BrowserPool` per server. It owns a Playwright driver, a `GuardedProxy` and at most one current Chromium process.
+
+**Lifecycle.** The first render starts the proxy on a free loopback port, then the Playwright driver, then a headless Chromium. Chromium is launched with the proxy, `--proxy-bypass-list=<-loopback>`, `--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1`, `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` and `--js-flags=--max-old-space-size=<browser_js_heap_mb>`. A browser serves `browser_recycle_after` pages and is then retired. New renders go to a fresh browser, and the old one is closed when its last page finishes. A browser that disconnects, or whose context would not close within five seconds, is replaced the same way. `aclose` marks the pool closed, closes every browser, stops the driver (which kills anything it still owns, including a browser whose launch was cancelled) and closes the proxy. A render that arrives after that gets `render_unavailable` and launches nothing.
+
+**One render.** Under `asyncio.timeout(render_timeout_s)`:
+
+1. Take one of `browser_max_pages` slots, then a browser.
+2. Open a new context with service workers blocked, downloads off and Weft's User-Agent. Contexts are never reused, so cookies and storage die with the call.
+3. Route every request in the context through one handler:
+   - **Not a navigation.** Continue it. Chromium sends it to the proxy.
+   - **The first navigation.** Fulfil it with the body, status and content type the Fetcher already has. There is no second fetch.
+   - **Any other navigation** (frames, script navigations, popups). Non-GET is aborted. A GET goes to `Fetcher.fetch(url, follow_redirects=False)`, so the hop gets robots.txt, the breaker, the host's slot and spacing, retries and the address guard, as a plain fetch does. A refusal aborts the request. A redirect comes back with its `location`. Chromium follows a fulfilled 3xx without asking the route again, so the next hop would skip the Fetcher. The handler answers with a 200 page holding a `<meta http-equiv="refresh">` to the target instead, and the next hop arrives as a new navigation.
+4. Go to the document's final URL and wait for `load`, then up to three seconds for the network to go quiet.
+5. Serialise the DOM, cap it at `max_body_bytes`, note `page.url`, and close the context.
+
+A Playwright error (a crashed tab, a heap that ran out) becomes `render_failed`. Running out of time becomes `timeout`. Either way the context is closed and the browser stays usable.
+
+**The proxy.** `GuardedProxy` speaks the part of HTTP/1.1 that Chromium uses with a proxy. `CONNECT host:port` (HTTPS and WebSockets) opens an upstream through `GuardedBackend.connect_tcp`, the same code that guards plain HTTP, answers 200 and copies bytes both ways. An absolute-form request (plain `http://`) is rewritten to origin form, with `Host` taken from the URL, hop-by-hop headers dropped and `Connection: close` added, and only the request's own `Content-Length` body is forwarded. A request with `Transfer-Encoding` gets 411, because the proxy cannot tell where it would end. Anything else the client sends on that connection is read and dropped, so a second request can never reuse an upstream checked for another host. A blocked address answers 403 with the same message as plain HTTP, which does not say where the name points. A name that does not resolve answers 502, and a connect timeout 504. Heads over 64 KiB and malformed requests get 400. A tunnel ends when either side closes or goes quiet for `read_timeout_s`. Closing the proxy ends every open tunnel.
 
 ## Storage
 
@@ -85,13 +114,15 @@ Schema version 1 (created at startup, no code reads or writes these tables yet):
 | `frontier` | URLs per job, ordered by score | primary key `(job_id, url)`, `depth`, `score`, `state`, `attempts`; cascades on job delete |
 | `pages` | Page cache | primary key `url`, `final_url`, `status`, `etag`, `last_modified`, `content_hash`, `markdown`, `expires_at` |
 
-Phase 4 will migrate these as the crawler needs. Expect a version 2. Nothing from Phase 2 is stored: the robots cache, limiter state and breaker state live in memory and start empty.
+Phase 4 will migrate these as the crawler needs. Expect a version 2. Nothing from Phase 2 or 3 is stored: the robots cache, limiter state, breaker state and browser pool live in memory and start empty.
 
 ## Configuration
 
 `Settings` (pydantic-settings). Precedence: init arguments, `WEFT_*` environment variables, TOML file, defaults. The TOML path is `WEFT_CONFIG`, falling back to `./weft.toml`. The CLI's `--config` sets `WEFT_CONFIG`. Unknown keys are rejected. The CLI prints validation problems by field name and never echoes the offending value.
 
-Phase 2 added `allow_loopback`, `host_min_interval_s`, `host_concurrency`, `global_concurrency`, `max_retries`, `retry_backoff_s`, `breaker_threshold` and `extract_timeout_s`. Three values stay constants: the breaker's 30 second cooldown, the robots.txt cache time of an hour, and the minute that an unreadable robots.txt is remembered. Nobody had a reason to tune them, and a setting is easier to add than to take back.
+Phase 2 added `allow_loopback`, `host_min_interval_s`, `host_concurrency`, `global_concurrency`, `max_retries`, `retry_backoff_s`, `breaker_threshold` and `extract_timeout_s`. Phase 3 added `render_min_words`, `render_timeout_s`, `browser_max_pages`, `browser_recycle_after` and `browser_js_heap_mb`. The three-second settle wait after `load` and the five-second limit on closing a context are constants.
+
+Three values stay constants: the breaker's 30 second cooldown, the robots.txt cache time of an hour, and the minute that an unreadable robots.txt is remembered. Nobody had a reason to tune them, and a setting is easier to add than to take back.
 
 ## Logging
 
@@ -101,6 +132,8 @@ Secrets are redacted by field name (token, secret, password, authorization, cook
 
 Phase 2 adds two lines to the `weft.fetch` logger: a warning, `refused non-public address`, with the host and the addresses it resolved to (the caller is not told them), and an info line, `retrying`, with the attempt number and the reason. The existing `fetch failed` warning now also carries the new error codes.
 
+Phase 3 adds `browser started` (info, with the launch count), `browser unavailable` and `render failed` (warnings, with the first line of the Playwright error), and `render skipped` (info, when `"auto"` falls back to HTTP, with the code). A navigation the Fetcher refuses inside a render is logged as an ordinary `fetch failed`.
+
 ## Security posture
 
 In place:
@@ -109,6 +142,7 @@ In place:
 - **Loopback.** Refused, unless `allow_loopback` is set. That setting opens `127.0.0.0/8` and `::1` and nothing else. The remote transport in Phase 6 must not enable it.
 - **What the caller learns.** A refusal says that a name resolves to a non-public address. It does not say which one, so a probe cannot map internal DNS.
 - **Proxies.** The HTTP client ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`. A proxy resolves names for itself and would sit outside the check. `SSL_CERT_FILE` still applies.
+- **The browser.** Chromium never opens a connection of its own. The document comes from the Fetcher. Every other navigation is fetched by the Fetcher one hop at a time. All other traffic goes through `GuardedProxy`, which uses the same `GuardedBackend` as plain HTTP. `<-loopback>` removes Chromium's built-in rule that sends localhost traffic around a proxy. Weft passes it explicitly, so an environment variable that turns off Playwright's own default cannot undo it. Chromium's own resolver answers "not found" for every name except the proxy's address, so anything that tried to go around the proxy could not even look up a host. WebRTC may not send UDP that the proxy cannot carry. Chromium refuses WebTransport behind a proxy by itself, and a test keeps it that way. Service workers are blocked. A test also calls `register` through the prototype, which gets past a stub on the navigator object, and checks that the script is never fetched. Contexts are discarded after each render.
 - **Politeness.** robots.txt on every hop, per-host spacing and concurrency, a global cap, retries with backoff, and a breaker per host. Weft has no setting to ignore robots.txt.
 - **Existing controls.** URLs limited to http and https, no credentials in URLs, caps on time, size and redirect hops, no cookie persistence, error details masked from the client, secrets redacted from logs, and a server instruction telling the agent that page content is untrusted.
 
@@ -124,6 +158,11 @@ Known ceilings:
 - On Windows a numeric spelling such as `2130706433` fails to resolve at all, after about three seconds, so the error is `network_error` there and `blocked_address` on Linux and macOS. Nothing connects either way.
 - HTTP/2 through the guarded transport has no test. The fixture can serve HTTPS, but it speaks HTTP/1.1 over it.
 - A page that hangs extraction occupies one of four threads until it finishes. Four of them stop extraction.
+- Pacing and the breaker apply to the browser's navigations, not to its sub-resources. A page that loads a hundred images from a host sends a hundred requests through the proxy, unpaced. Each one is still address-checked.
+- The proxy listens on a loopback port without authentication. Another local process could use it, but only to reach addresses the guard allows.
+- `browser_js_heap_mb` caps JavaScript memory per tab, not DOM, image or GPU memory. There is no per-render byte cap on sub-resources. `render_timeout_s` bounds how long a render can keep pulling them.
+- The fulfilled document carries only its status and content type, not the origin's other headers, so the page runs without its own Content-Security-Policy. Nothing in a throwaway context is worth protecting, but the rendered DOM can differ from what a real visitor sees.
+- `status` in a rendered result is the document's status, even if a script then navigated to another page.
 - A gzip bomb is cut at the byte cap, but the check runs per decoded chunk, so memory can spike to about 1000 times one network chunk before the cut.
 
 ## Tests
@@ -135,5 +174,11 @@ Known ceilings:
 The address table, the robots matcher, the limiter and the breaker are tested as pure units with a fake clock or a fake resolver, with no sleeping and no network. The DNS rebinding cases use a fake resolver that gives a different answer on each call, and a fake inner backend that records what it was asked to connect to. End-to-end tests run the real `Fetcher` against the fixture site.
 
 The fixture can also serve HTTPS. `tests/test_tls.py` makes a throwaway certificate with `cryptography`, valid for the name `localhost` and no IP address, and trusts it through `SSL_CERT_FILE`. Fetching `https://localhost:PORT/` can only succeed if the certificate is checked against the name in the URL while the socket goes to the pinned address. A second test serves a certificate for another name and expects the fetch to fail, so verification is known to be on.
+
+Phase 3 adds a JavaScript shell page, `/goto` (a redirect to a target the test names), `/sw.js`, `/echo-body` and `/host` to the fixture. The fixture now counts every request method, and tests can count requests by path prefix.
+
+`tests/test_proxy.py` drives `GuardedProxy` with raw sockets and a recording backend, with no browser: CONNECT and plain forwarding, refusals before any connect, rebinding between connections, one request per connection, request bodies, Host rewriting, malformed and oversized heads, and tunnels closing with the proxy.
+
+`tests/test_browser.py` runs a real headless Chromium. The SSRF cases put the proxy behind a fake resolver (`cdn.test` public, `internal.test` private) and a backend that connects every address to the fixture site. If anything got past the guard, the fixture would count the request, so a zero count proves the guard refused it. The main case serves an allowed page that tries images, a stylesheet, `fetch`, WebSockets, a beacon, a worker, a redirect from an allowed host to a blocked one, and a frame, against private, loopback, `localhost` and `[::1]` targets. Positive controls (a script, a fetch, a WebSocket and a redirect on the allowed host) must reach the fixture by the same mechanisms. Other cases cover UDP (WebRTC and WebTransport, checked on a UDP socket), service workers, robots.txt, spacing and the breaker on navigations, the page cap, recycling, a heap blowout, a tab spinning forever, the render timeout, a missing browser and a closed pool. These tests skip if `chromium-headless-shell` is not installed. The rendering tests in `tests/test_page.py` do not skip: they fail without it.
 
 `tests/test_server.py` includes a real stdio round trip: it spawns `python -m weft` and talks to it over pipes.

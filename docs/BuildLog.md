@@ -169,3 +169,102 @@ backend on its connection pool through a private attribute, and note in the
 architecture doc that raising the pin means re-running tests/test_ssrf.py first.
 Add .gitattributes so text files are checked out with LF on every platform.
 ```
+
+## Phase 3: rendering (2026-11-19)
+
+### Done
+
+A guarded local proxy for Chromium, a browser pool with reuse and hard limits, navigation routing through the Fetcher, and the render policy for `fetch_page`. `render="always"` works now. Two new modules (`fetch/proxy.py`, `fetch/browser.py`), a one-hop mode on `Fetcher.fetch`, five new settings, Playwright as a dependency, and 361 tests. The session started from tests for the proxy and fixture additions that an interrupted earlier session had left uncommitted. I kept those tests, fixed one and added four. Nothing was committed, tagged or pushed.
+
+No Chromium was downloaded. Playwright 1.65.2 was already in the virtual environment, and the headless shell it drives (build 1255) was already in the local Playwright cache.
+
+### Verification
+
+- `pytest`: 361 passed, none skipped (about 165 seconds, up from 100: each browser test starts its own Chromium)
+- `ruff check .` and `ruff format --check .`: clean
+- `mypy` (strict, `src/weft`): clean
+- `uv build`: sdist and wheel built into a scratch directory. The wheel holds `fetch/proxy.py` and `fetch/browser.py` and declares `playwright>=1.65,<2`.
+- A real stdio server (`python -m weft`) fetched the JavaScript shell with `render="auto"` and with `render="always"`. Both came back as `fetch_method: "browser"` with the rendered text.
+- Processes. Before the first test there were no `chrome-headless-shell.exe` processes, and one `node.exe` that was not mine. After every browser run, the full suite, every mutation run and the stdio check, I checked again with `tasklist`: no Chromium, no Playwright driver and no stray Python were left.
+- Mutation checks. I removed each defence in turn and ran the tests that should catch it. Eight of nine were caught: the proxy skipping the address check, removing `<-loopback>` (with Playwright's own default turned off by its environment variable), the WebRTC policy, service worker blocking, routing navigations through the Fetcher, the refresh used in place of a 3xx, the page cap and recycling. The survivor is the resolver rule. It is a second layer behind the proxy, and no test can bypass the proxy to exercise it.
+- One mutation run hung until its 300 second limit. The same mutation passed in five seconds when run again, and no process was left behind either time. I could not reproduce it and have no cause for it.
+- Not verified: Linux and Docker (Phase 6), HTTP/2 through the proxy, and memory use under load (Phase 7).
+
+### Decisions
+
+- **The browser never fetches the document.** Every mode starts with a plain fetch, and the browser is handed that body. Robots.txt, the address guard and every redirect hop of the document are handled once, by code that already has tests, and a render costs no second request to the site.
+- **The address check sits in a proxy.** Playwright's routing does not see WebSockets, service worker traffic or redirects that follow a fulfilled response. An HTTP proxy sees every TCP connection Chromium makes for the web. It reuses `GuardedBackend`, so there is one address check in the codebase, not two.
+- **Navigations go through the Fetcher; sub-resources do not.** The handoff asked for robots.txt, limits and the breaker on navigations. Pacing every image at one per second would make rendering useless, so sub-resources get the address check only.
+- **Redirects become a refresh.** Chromium follows a fulfilled 3xx without asking the route again (see Problems). The route answers a redirect with a 200 page that refreshes to the target, so each hop is a new navigation and reaches the Fetcher.
+- **Belt and braces in Chromium.** `--host-resolver-rules` stops Chromium resolving anything but the proxy's address. `<-loopback>` is passed explicitly even though Playwright adds it, because Playwright lets an environment variable switch its default off. WebRTC is limited to proxied traffic.
+- **One browser, many contexts.** A process per render would cost a second or more each time. A context per render keeps cookies and storage from crossing calls. Recycling after `browser_recycle_after` pages caps slow growth. A retired browser closes when its last page finishes, so recycling never cuts off a page in flight.
+- **Hard limits that Chromium enforces.** The page cap is a semaphore, and the heap cap is V8's own `--max-old-space-size`, which kills a tab that passes it. A tab spinning in a loop is cut off by `render_timeout_s`, and the browser is then reused.
+- **The render policy keys on scripts.** A page with no `<script>` cannot gain content in a browser, so `"auto"` never renders it however thin it is. With a script, it renders under `render_min_words` words, or when a `<noscript>` mentions JavaScript, the usual mark of a single-page app that has navigation text.
+- **`auto` is best effort.** If the browser is missing or the render fails, `"auto"` returns the HTTP result, and `fetch_method` says so. Only `"always"` reports render errors.
+- **The browser starts lazily.** A server that never meets a JavaScript page never starts Chromium, and a machine without Chromium still serves plain fetches.
+- **`render_timeout_s` is its own budget,** after `total_timeout_s`. The plain fetch already spends that budget, and rendering includes a cold start. The worst case for one call is the sum of the two plus extraction.
+
+### Problems hit
+
+- **The resolver rule cut off the proxy.** My first launch used `--host-resolver-rules=MAP * ~NOTFOUND`, and every sub-resource failed. The rule also maps `127.0.0.1`, the proxy's own address. The positive controls in the SSRF test caught it: they require an allowed request to arrive, so a browser that could reach nothing did not pass as safe. `EXCLUDE 127.0.0.1` fixed it.
+- **Playwright's service worker block is a stub.** `service_workers="block"` replaces `navigator.serviceWorker.register` with a function that resolves, so the page believes it registered a worker. My first test expected a rejection and failed. The test now checks the network instead (`/sw.js` is never requested), and it also calls `register` through `ServiceWorkerContainer.prototype`, which would get past a stub on the navigator object. Both stay blocked, and setting `"allow"` makes the test fail.
+- **Redirects after a fulfilled response skipped robots.txt.** The robots test caught a frame whose redirect target, under `/private/`, reached the fixture. A debug run showed the route handler called once for the first hop and never for the second: Chromium followed the fulfilled 302 itself, through the proxy. The address check still applied, but robots.txt and pacing did not. The refresh page fixed it, and the test now fails if a 3xx is fulfilled again.
+- **The WebRTC test read the page too early.** Its two-second timer outlasted the network-idle wait, so the page was captured before the script finished. It now marks the page once gathering starts and waits a second on the UDP socket.
+- **WebTransport.** It runs over QUIC, which is UDP, so I expected a second hole. With every Weft flag removed, Chromium still refused it behind a proxy and sent no datagram. A test keeps that true.
+- **A fixture file had CRLF endings** from the interrupted session's edits. It is LF again.
+- **A hit count on the shared fixture site.** The interrupted session's proxy test asserted `hits("/ua") == 1` on the session-wide site, so it depended on test order. It now compares before and after.
+
+### Review
+
+I reviewed the code in this session from four angles (correctness, security, concurrency, maintainability) and reconciled the findings, then ran an over-engineering review.
+
+Fixed:
+
+- **A closed pool could relaunch Chromium.** Found by the concurrency pass. A render queued behind `aclose` would find no browser, start the driver again and launch one, and nobody would close it. The pool now marks itself closed under the same lock, and a later render gets `render_unavailable`. Test written first and watched failing.
+- **Redirect hops escaped the Fetcher.** See Problems. Found by a test, then confirmed by the security pass as the only path where a navigation reached the proxy.
+- **Error logging could raise.** `str(exc).splitlines()[0]` fails on an empty message. A small helper takes the first line or nothing.
+- **The `<noscript>` branch of the render policy had no test.** `wants_render` now has a table test covering all five cases.
+- **The proxy forwarded the client's `Host` header.** It now takes `Host` from the URL, whose address was the one checked. The old behaviour was not an SSRF, because the connection still went to the checked address, but it sent a misleading request upstream. Test added.
+- **Over-engineering review.** Skipped: proxy authentication, an init script that removes `RTCPeerConnection`, `--disable-quic`, and a byte counter in the proxy. The flags already in place cover the first three, and the tests show it. The counter has no caller until a crawl needs per-job byte budgets. Kept: the `_Instance` record (it carries the use and in-flight counts that make recycling safe) and `open_browsers` (three lines, and the only way a test can show that retired browsers closed).
+
+Accepted and recorded, not fixed:
+
+- Sub-resources are unpaced and have no byte budget, only a time budget.
+- The loopback proxy has no authentication.
+- The heap cap covers JavaScript only.
+- A rendered page runs without the origin's headers, Content-Security-Policy included.
+- `status` in a rendered result is the document's status, even after a script navigates elsewhere.
+- The branch that replaces a browser after a context will not close has no test.
+- `render="auto"` may render pages that have a `<noscript>` JavaScript notice beside a full article. That costs time, not correctness.
+
+The jury was again one reviewer playing four roles. The proxy and the browser flags are the parts most worth an outside read before Phase 6 puts this on a network.
+
+### Commit message draft
+
+```
+Phase 3: headless rendering behind a guarded proxy
+
+Add a browser pool that renders pages in headless Chromium when plain HTTP
+is not enough. render="auto" renders a page that has a script and thin text,
+or a noscript notice asking for JavaScript, and falls back to the HTTP result
+if rendering fails. render="always" renders every HTML page and reports
+render_unavailable or render_failed. render="never" never starts a browser.
+
+Chromium makes no connection of its own. The document is the body the Fetcher
+already fetched. Every other navigation is fetched by the Fetcher one hop at a
+time, so robots.txt, host spacing, the circuit breaker and the address guard
+apply to frames, script navigations and each redirect hop. All other traffic
+goes through a local proxy that connects through the same GuardedBackend as
+plain HTTP. Chromium is launched with no loopback bypass, no name resolution
+of its own and no WebRTC UDP outside the proxy, and service workers are
+blocked.
+
+One browser is reused with a fresh context per render, capped at
+browser_max_pages pages at once, replaced after browser_recycle_after pages,
+with a JavaScript heap cap per tab and a per-render timeout. Shutdown closes
+every browser and the driver, and a closed pool launches nothing.
+
+Add a one-hop mode to Fetcher.fetch, five settings, Playwright as a
+dependency, proxy and browser tests that prove blocked hosts are never
+contacted, and docs.
+```

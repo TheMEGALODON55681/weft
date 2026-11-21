@@ -6,8 +6,8 @@ Build order is fixed. Each phase is finished, tested and documented before the n
 | --- | --- | --- |
 | 1 | Skeleton: config, logging, SQLite schema, `fetch_page` over plain HTTP, stdio MCP server, tests | Done |
 | 2 | Safety and politeness: robots.txt, rate limits, SSRF guard, retries, circuit breaker | Done |
-| 3 | Rendering: Playwright pool, auto-escalation policy | Next |
-| 4 | Crawling: frontier, goal scoring, dedupe, `crawl_site`, `map_site`, jobs, resume | Not started |
+| 3 | Rendering: Playwright pool, auto-escalation policy | Done |
+| 4 | Crawling: frontier, goal scoring, dedupe, `crawl_site`, `map_site`, jobs, resume | Next |
 | 5 | Retrieval: passage ranking, `search_in_site`, schema `extract` | Not started |
 | 6 | Remote: streamable HTTP transport, bearer auth, Docker, `/healthz` | Not started |
 | 7 | Hardening: load test, fuzzing, docs polish | Not started |
@@ -29,7 +29,7 @@ Gaps Phase 1 left, and what became of them:
 - Extraction had no timeout. Closed in Phase 2, with one ceiling: see below.
 - The README warned that there was no SSRF guard. Removed in Phase 2, once the guard and its tests were in.
 - HTTP/2 is configured but no test exercises it. Phase 2 added a TLS fixture, but it speaks HTTP/1.1 over TLS, so HTTP/2 still needs a server that negotiates `h2`. Still open, Phase 7.
-- `render="always"` returns `render_unavailable`. Phase 3.
+- `render="always"` returned `render_unavailable`. Closed in Phase 3.
 - The `jobs`, `frontier` and `pages` tables exist and nothing uses them. Phases 4 and 5.
 - Conditional requests and the TTL page cache. Phase 4, when crawls repeat fetches.
 
@@ -57,14 +57,34 @@ Left for later:
 - The `Sitemap:` lines in robots.txt are ignored. `map_site` will want them. Phase 4.
 - A wait longer than `total_timeout_s` is refused. A long crawl job will want its own, longer budget. Phase 4.
 
-## Phase 3: next
+## Phase 3: done
 
-Scope: a Playwright pool, reuse, hard memory and page limits, and the policy that escalates from plain HTTP to the browser only when the extracted text is thin or the page is a JavaScript shell.
+Delivered:
 
-Starting points left by Phase 2:
+- `GuardedProxy` (`fetch/proxy.py`), a local HTTP proxy that Chromium is forced through. Every connection it opens goes through the same `GuardedBackend` as plain HTTP, so sub-resources, redirects between them, WebSockets and workers get the same address check and the same DNS rebinding protection.
+- `BrowserPool` (`fetch/browser.py`): one headless Chromium reused across renders, a fresh context per page, at most `browser_max_pages` pages at once, replacement after `browser_recycle_after` pages, a JavaScript heap cap per tab, a timeout per render, recovery from crashed and spinning tabs, and a clean shutdown that leaves no process behind.
+- Browser navigations go through the Fetcher one hop at a time, so robots.txt, host spacing and the circuit breaker apply to frames, script navigations and every redirect hop.
+- Chromium cannot resolve names itself, cannot bypass the proxy for loopback, cannot send WebRTC UDP around it, and cannot register service workers.
+- The render policy. `render="auto"` renders a page that has a script and either thin text or a `<noscript>` asking for JavaScript, and falls back to the HTTP result if rendering fails. `render="always"` renders every HTML page and reports failures. `render="never"` never starts a browser.
+- 361 tests, ruff and strict mypy clean, wheel builds with the new modules and the Playwright dependency.
 
-- **Chromium does its own DNS and its own connections, so `fetch/ssrf.py` does not protect it.** Every request the browser makes, including sub-resources and redirects, has to go through an address check before it leaves, by request interception or a local proxy that applies `is_blocked`. This is the main safety task of the phase. Test it with the same redirect and rebinding cases used for plain HTTP.
-- The browser's navigations should pass through the same robots.txt cache, host limiter and breaker, so a rendered fetch is as polite as a plain one. The `Fetcher` owns those objects. Share them, do not build second copies.
-- Rendering budgets sit inside `total_timeout_s`, or get their own setting with the same refusal behaviour.
-- The render policy keys on word count. Phase 1 found that trafilatura returns navigation text for a page with no article, so a JavaScript shell comes back thin, not empty.
-- The fixture site needs the JavaScript-rendered page that the architecture notes already promise.
+Left for later:
+
+- Sub-resources are not paced and have no byte budget per render, only a time budget. Phase 7 load tests will show whether that matters.
+- The proxy on loopback has no authentication. It only reaches addresses the guard allows. Phase 6 should check this inside the container, where other processes share the loopback interface.
+- `browser_js_heap_mb` caps JavaScript, not DOM, image or GPU memory. A child-process memory limit (a job object on Windows, cgroups in Docker) would be the hard cap. Phase 6 for Docker.
+- The path that replaces a browser whose context will not close has no test, because nothing in the fixture makes `close` hang.
+- A rendered page runs without the origin's response headers, Content-Security-Policy included, so its DOM can differ from what a real visitor sees.
+- Rendering repeats the HTTP/2 gap: the proxy speaks HTTP/1.1 to Chromium, while upstream HTTPS is a byte tunnel that Chromium negotiates itself.
+
+## Phase 4: next
+
+Scope: the frontier, goal scoring, dedupe, `crawl_site`, `map_site`, jobs and resume.
+
+Starting points left by Phases 2 and 3:
+
+- Per-host limiter and breaker state is never evicted. A crawl needs an LRU.
+- A wait longer than `total_timeout_s` is refused. A crawl job wants its own, longer budget.
+- `map_site` will want the `Sitemap:` lines of robots.txt, which are ignored today.
+- `get_page` already reports `fetch_method`, so the page cache can store which path produced a page. Rendering costs seconds, so the cache should keep rendered results.
+- A crawl that renders should share the one `BrowserPool`, whose `browser_max_pages` then caps how many crawl pages render at once.

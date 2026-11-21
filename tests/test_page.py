@@ -6,24 +6,29 @@ import pytest
 
 from fixture_site import FixtureSite
 from weft.config import Settings
+from weft.fetch.browser import BrowserPool
 from weft.fetch.errors import FetchError
 from weft.fetch.http import Fetcher
-from weft.fetch.page import get_page
+from weft.fetch.page import get_page, wants_render
 
 
 @pytest.fixture
 async def page_of(site: FixtureSite):
-    opened: list[Fetcher] = []
+    """Fetch a fixture path through get_page. `go.pools` holds the browser pool of each call."""
+    opened: list[tuple[BrowserPool, Fetcher]] = []
 
     async def go(path: str, render: str = "auto", **overrides: object):
         settings = Settings(**overrides)
         fetcher = Fetcher(settings)
-        opened.append(fetcher)
-        return await get_page(fetcher, settings, site.url(path), render)
+        pool = BrowserPool(settings, fetcher)
+        opened.append((pool, fetcher))
+        return await get_page(fetcher, settings, site.url(path), render, browser=pool)
 
+    go.pools = opened  # type: ignore[attr-defined]
     yield go
-    for f in opened:
-        await f.aclose()
+    for pool, fetcher in opened:
+        await pool.aclose()
+        await fetcher.aclose()
 
 
 async def test_article_end_to_end(site: FixtureSite, page_of) -> None:
@@ -156,7 +161,79 @@ async def test_extraction_runs_in_a_small_pool_of_its_own(
     assert 2 <= peak <= 4
 
 
-async def test_forced_rendering_says_it_is_unavailable(page_of) -> None:
+async def test_auto_leaves_a_full_page_alone_and_starts_no_browser(page_of) -> None:
+    p = await page_of("/article", render="auto")
+    assert p.fetch_method == "http"
+    assert page_of.pools[0][0].launches == 0
+
+
+async def test_auto_renders_a_javascript_shell(page_of) -> None:
+    p = await page_of("/js-shell", render="auto")
+    assert p.fetch_method == "browser"
+    assert "Rendered report" in p.markdown
+    assert p.final_url.endswith("/js-shell")
+
+
+async def test_never_returns_the_shell_as_fetched(page_of) -> None:
+    p = await page_of("/js-shell", render="never")
+    assert p.fetch_method == "http"
+    assert "Rendered report" not in p.markdown
+    assert page_of.pools[0][0].launches == 0
+
+
+async def test_always_renders_even_a_full_page(page_of) -> None:
+    p = await page_of("/article", render="always")
+    assert p.fetch_method == "browser"
+    assert "## Team plan" in p.markdown
+
+
+async def test_a_short_page_without_scripts_is_not_rendered(page_of) -> None:
+    """Thin but static: a browser would show the same words, so auto does not start one."""
+    p = await page_of("/ping", render="auto")
+    assert p.fetch_method == "http"
+    assert page_of.pools[0][0].launches == 0
+
+
+async def test_always_without_a_browser_says_so(
+    page_of, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
     with pytest.raises(FetchError) as e:
         await page_of("/article", render="always")
     assert e.value.code == "render_unavailable"
+
+
+async def test_auto_falls_back_to_plain_http_without_a_browser(
+    page_of, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
+    p = await page_of("/js-shell", render="auto")
+    assert p.fetch_method == "http"
+
+
+async def test_always_still_refuses_non_html(page_of) -> None:
+    with pytest.raises(FetchError) as e:
+        await page_of("/pdf", render="always")
+    assert e.value.code == "unsupported_content_type"
+    assert page_of.pools[0][0].launches == 0
+
+
+LONG = " ".join(["word"] * 60)
+
+
+@pytest.mark.parametrize(
+    ("html", "markdown", "expected"),
+    [
+        ("<div id=root></div><script>x()</script>", "", True),  # thin, with a script
+        ("<p>short</p>", "short", False),  # thin, but nothing would run
+        (f"<p>{LONG}</p><script>x()</script>", LONG, False),  # full page with scripts
+        (
+            f"<p>{LONG}</p><script>x()</script><noscript>Please enable JavaScript</noscript>",
+            LONG,
+            True,
+        ),
+        (f"<p>{LONG}</p><noscript>Enable JavaScript</noscript>", LONG, False),  # nothing to run
+    ],
+)
+def test_render_policy(html: str, markdown: str, expected: bool) -> None:
+    assert wants_render(html, markdown, min_words=50) is expected

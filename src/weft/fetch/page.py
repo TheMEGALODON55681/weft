@@ -1,15 +1,28 @@
-"""One URL in, one cited page out: fetch, decode, extract, apply the output caps."""
+"""One URL in, one cited page out: fetch, decode, extract, render if needed, apply output caps.
+
+The page is always fetched over plain HTTP first, so robots.txt, the address guard and every
+redirect hop are handled once, by the Fetcher. The browser, when it is used, renders that body.
+"""
 
 import asyncio
+import logging
+import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
+from selectolax.lexbor import LexborHTMLParser
+
 from weft.config import Settings
-from weft.extract.content import extract_page
+from weft.extract.content import Extracted, extract_page
 from weft.extract.decode import decode_body
+from weft.fetch.browser import BrowserPool
 from weft.fetch.errors import FetchError
-from weft.fetch.http import Fetcher
+from weft.fetch.http import Fetcher, FetchResult
 from weft.models import PageResult
+from weft.obs.logging import safe_url
+
+log = logging.getLogger("weft.fetch")
 
 RenderMode = Literal["auto", "never", "always"]
 _HTML_TYPES = frozenset({"text/html", "application/xhtml+xml"})
@@ -21,13 +34,43 @@ _HTML_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 _EXTRACT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="weft-extract")
 
 
+def wants_render(html: str, markdown: str, min_words: int) -> bool:
+    """A browser can only add content a script would write. So: the page has a script, and its
+    extracted text is thin, or a <noscript> says the page needs JavaScript."""
+    tree = LexborHTMLParser(html)
+    if tree.css_first("script") is None:
+        return False
+    if len(markdown.split()) < min_words:
+        return True
+    return any("javascript" in n.text().lower() for n in tree.css("noscript"))
+
+
+def _read_http(res: FetchResult, min_words: int) -> tuple[Extracted, bool]:
+    html = decode_body(res.body, res.charset)
+    page = extract_page(html, res.final_url)
+    return page, wants_render(html, page.markdown, min_words)
+
+
+async def _off_loop[T](settings: Settings, fn: Callable[[], T]) -> T:
+    """Decoding and parsing are CPU-bound; keep them off the event loop, under a timeout."""
+    try:
+        async with asyncio.timeout(settings.extract_timeout_s):
+            return await asyncio.get_running_loop().run_in_executor(_EXTRACT_POOL, fn)
+    except TimeoutError:
+        raise FetchError(
+            "extraction_timeout",
+            f"reading the page took longer than {settings.extract_timeout_s:g}s",
+        ) from None
+
+
 async def get_page(
-    fetcher: Fetcher, settings: Settings, url: str, render: RenderMode = "auto"
+    fetcher: Fetcher,
+    settings: Settings,
+    url: str,
+    render: RenderMode = "auto",
+    browser: BrowserPool | None = None,
 ) -> PageResult:
-    if render == "always":
-        # Browser rendering arrives with the Playwright pool; until then say so plainly
-        # instead of quietly returning an unrendered page.
-        raise FetchError("render_unavailable", "browser rendering is not available in this build")
+    start = time.perf_counter()
     res = await fetcher.fetch(url)
     # An absent Content-Type is treated as HTML, as browsers do.
     if res.content_type and res.content_type not in _HTML_TYPES:
@@ -35,32 +78,48 @@ async def get_page(
             "unsupported_content_type",
             f"{res.content_type} (HTTP {res.status}) is not HTML",
         )
-    # Decoding and parsing are CPU-bound; keep them off the event loop.
+    if render != "always":
+        page, wanted = await _off_loop(settings, lambda: _read_http(res, settings.render_min_words))
+        if render == "never" or not wanted:
+            return _result(res, page, res.final_url, res.truncated, "http", start, settings)
     try:
-        async with asyncio.timeout(settings.extract_timeout_s):
-            extracted = await asyncio.get_running_loop().run_in_executor(
-                _EXTRACT_POOL,
-                lambda: extract_page(decode_body(res.body, res.charset), res.final_url),
-            )
-    except TimeoutError:
-        raise FetchError(
-            "extraction_timeout",
-            f"reading the page took longer than {settings.extract_timeout_s:g}s",
-        ) from None
-    markdown = extracted.markdown[: settings.max_content_chars]
+        if browser is None:
+            raise FetchError("render_unavailable", "this server has no browser")
+        shot = await browser.render(res)
+    except FetchError as exc:
+        if render == "always":
+            raise
+        # auto is best effort: the plain page is still an answer.
+        log.info("render skipped", extra={"url": safe_url(res.final_url), "code": exc.code})
+        return _result(res, page, res.final_url, res.truncated, "http", start, settings)
+    rendered = await _off_loop(settings, lambda: extract_page(shot.html, shot.final_url))
+    truncated = res.truncated or shot.truncated
+    return _result(res, rendered, shot.final_url, truncated, "browser", start, settings)
+
+
+def _result(
+    res: FetchResult,
+    page: Extracted,
+    final_url: str,
+    truncated: bool,
+    method: Literal["http", "browser"],
+    start: float,
+    settings: Settings,
+) -> PageResult:
+    markdown = page.markdown[: settings.max_content_chars]
     return PageResult(
         url=res.url,
-        final_url=res.final_url,
+        final_url=final_url,
         status=res.status,
-        fetch_method="http",
+        fetch_method=method,
         content_type=res.content_type,
-        title=extracted.title,
+        title=page.title,
         markdown=markdown,
-        metadata=extracted.metadata,
-        links=extracted.links[: settings.max_links],
-        links_total=len(extracted.links),
-        body_truncated=res.truncated,
-        content_truncated=len(markdown) < len(extracted.markdown),
+        metadata=page.metadata,
+        links=page.links[: settings.max_links],
+        links_total=len(page.links),
+        body_truncated=truncated,
+        content_truncated=len(markdown) < len(page.markdown),
         redirects=res.redirects,
-        elapsed_ms=res.elapsed_ms,
+        elapsed_ms=(time.perf_counter() - start) * 1000,
     )
