@@ -77,3 +77,28 @@ def test_redaction_reaches_into_lists_of_dicts() -> None:
     assert "sid=1" not in out.getvalue()
     assert '"t"' not in out.getvalue()
     assert json.loads(out.getvalue())["hops"][0] == {"url": "u", "Cookie": "***"}
+
+
+def test_the_http_servers_loggers_write_the_same_format() -> None:
+    """uvicorn, fastmcp and the MCP SDK each log through their own logger. A plain-text line
+    among the JSON ones would break a log pipeline that parses every line."""
+    out = io.StringIO()
+    configure_logging("INFO", stream=out)
+    for name in ("uvicorn.error", "fastmcp.server", "mcp.server.streamable_http"):
+        logging.getLogger(name).info("hello from %s", name)
+    lines = out.getvalue().splitlines()
+    assert [json.loads(ln)["msg"] for ln in lines] == [
+        "hello from uvicorn.error",
+        "hello from fastmcp.server",
+        "hello from mcp.server.streamable_http",
+    ]
+
+
+def test_uvicorns_colour_variant_of_a_message_is_not_logged() -> None:
+    out = io.StringIO()
+    configure_logging("INFO", stream=out)
+    logging.getLogger("uvicorn.error").info(
+        "Started server process [%d]", 7, extra={"color_message": "[36m%d[0m"}
+    )
+    rec = json.loads(out.getvalue())
+    assert rec["msg"] == "Started server process [7]" and "color_message" not in rec

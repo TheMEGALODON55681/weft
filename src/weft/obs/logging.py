@@ -15,7 +15,12 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 _SENSITIVE = re.compile(
     r"token|secret|passw|auth|cookie|session|signature|api[_-]?key|^key$|_key$", re.I
 )
-_STANDARD_ATTRS = frozenset(logging.makeLogRecord({}).__dict__) | {"message", "asctime"}
+# uvicorn puts an ANSI-coloured copy of each message in `color_message`.
+_STANDARD_ATTRS = frozenset(logging.makeLogRecord({}).__dict__) | {
+    "message",
+    "asctime",
+    "color_message",
+}
 
 
 def _redact(value: Any, key: str = "") -> Any:
@@ -46,15 +51,17 @@ class _JsonFormatter(logging.Formatter):
 
 
 def configure_logging(level: str = "INFO", stream: TextIO | None = None) -> None:
-    """Attach a single JSON handler to the `weft` logger. Safe to call repeatedly."""
-    logger = logging.getLogger("weft")
-    for old in list(logger.handlers):
-        logger.removeHandler(old)
+    """Attach a single JSON handler to the `weft` logger and to the loggers of the HTTP stack, so
+    that stderr holds one format. Safe to call repeatedly."""
     handler = logging.StreamHandler(stream or sys.stderr)
     handler.setFormatter(_JsonFormatter())
-    logger.addHandler(handler)
-    logger.setLevel(level)
-    logger.propagate = False
+    for name in ("weft", "uvicorn", "fastmcp", "mcp"):
+        logger = logging.getLogger(name)
+        for old in list(logger.handlers):
+            logger.removeHandler(old)
+        logger.addHandler(handler)
+        logger.setLevel(level)
+        logger.propagate = False
 
 
 def safe_url(url: str) -> str:

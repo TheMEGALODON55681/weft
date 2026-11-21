@@ -1,5 +1,6 @@
 """MCP tool definitions. Transport-agnostic: the same server object runs over stdio or HTTP."""
 
+import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -11,6 +12,8 @@ from fastmcp import Context, FastMCP
 from fastmcp.dependencies import CurrentContext
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from weft.config import Settings
 from weft.db import Database
@@ -39,6 +42,7 @@ from weft.providers import EmbeddingProvider, LlmProvider, chat_from, embeddings
 from weft.rank.bm25 import terms
 from weft.rank.rerank import RERANK_CANDIDATES
 from weft.retrieval import extract_job, extract_url, search
+from weft.server.auth import BearerToken
 
 log = logging.getLogger("weft.server")
 
@@ -56,6 +60,9 @@ _MAX_JOB_PAGES = 5000
 
 # How often crawl_site reports progress while it waits for its job.
 _PROGRESS_EVERY_S = 1.0
+
+# How long /healthz waits for the database before it answers 503.
+HEALTH_TIMEOUT_S = 2.0
 
 
 class JobList(BaseModel):
@@ -84,6 +91,16 @@ class AppState:
     llm: LlmProvider | None  # None unless llm_extraction is on
 
 
+async def _database_answers(state: AppState) -> bool:
+    try:
+        async with asyncio.timeout(HEALTH_TIMEOUT_S):
+            await state.deps.db.run(lambda conn: conn.execute("SELECT 1").fetchone())
+    except Exception:
+        log.warning("health check failed", exc_info=True)
+        return False
+    return True
+
+
 async def _crawl(
     state: AppState, ctx: Context, params: CrawlParams, wait_s: float, limit: int
 ) -> JobResult:
@@ -110,6 +127,8 @@ def build_server(
 ) -> FastMCP:
     """`embedder` and `llm` stand in for the configured providers, which tests use to keep the
     network out. Each is used only when its flag is on, as the configured one would be."""
+
+    live: dict[str, AppState] = {}  # holds the state while the lifespan runs, for /healthz
 
     @asynccontextmanager
     async def lifespan(_server: FastMCP) -> AsyncIterator[dict[str, AppState]]:
@@ -140,8 +159,10 @@ def build_server(
                     (embedder or embed_client) if settings.embedding_rerank else None,
                     (llm or chat_client) if settings.llm_extraction else None,
                 )
+                live["state"] = state
                 yield {"state": state}
             finally:
+                live.clear()
                 await jobs.aclose()  # first: crawls use the browser and the fetcher
                 for client in (embed_client, chat_client):
                     if client is not None:
@@ -151,7 +172,22 @@ def build_server(
         finally:
             await db.close()
 
-    mcp = FastMCP("weft", instructions=INSTRUCTIONS, lifespan=lifespan, mask_error_details=True)
+    # Auth guards the streamable HTTP endpoint only. stdio has no network to guard.
+    auth = BearerToken(settings.auth_token.get_secret_value()) if settings.auth_token else None
+    mcp = FastMCP(
+        "weft", instructions=INSTRUCTIONS, lifespan=lifespan, mask_error_details=True, auth=auth
+    )
+
+    @mcp.custom_route("/healthz", methods=["GET"])
+    async def healthz(_request: Request) -> JSONResponse:
+        """Open to anyone, so it says no more than whether the server can use its database."""
+        state = live.get("state")
+        ok = state is not None and await _database_answers(state)
+        return JSONResponse(
+            {"status": "ok" if ok else "unavailable"},
+            status_code=200 if ok else 503,
+            headers={"Cache-Control": "no-store"},
+        )
 
     @mcp.tool(
         annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},

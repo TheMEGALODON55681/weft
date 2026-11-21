@@ -119,6 +119,11 @@ class _Extraction:
         llm = self._llm
         if not errors or llm is None or self._llm_left <= 0:
             return ExtractItem(url=url, data=data, valid=not errors, errors=errors, method="rules")
+        if doc.page.status >= 400:  # an error page holds nothing worth a billed call
+            skipped = f"llm: skipped, the page answered with status {doc.page.status}"
+            return ExtractItem(
+                url=url, data=data, valid=False, errors=[*errors, skipped], method="rules"
+            )
         self._llm_left -= 1
         answer, problem = await self._ask(llm, doc)
         if problem is not None:

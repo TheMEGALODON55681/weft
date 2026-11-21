@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from weft import __version__
 from weft.config import Settings
@@ -143,3 +143,98 @@ def test_provider_limits_must_be_positive(field: str) -> None:
     Settings(**{field: 1})
     with pytest.raises(ValidationError):
         Settings(**{field: 0})
+
+
+# --- Phase 6: the remote transport -----------------------------------------------------------
+
+TOKEN = "t0ken-" + "x" * 30
+
+
+def test_the_default_transport_is_stdio_on_loopback_with_no_token() -> None:
+    s = Settings()
+    assert (s.transport, s.http_host, s.http_port, s.auth_token) == (
+        "stdio",
+        "127.0.0.1",
+        8000,
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "host", ["127.0.0.1", "127.9.9.9", "::1", "[::1]", "localhost", "LOCALHOST"]
+)
+def test_http_on_loopback_needs_no_token(host: str) -> None:
+    assert Settings(transport="http", http_host=host).auth_token is None
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["0.0.0.0", "::", "", "192.168.1.5", "10.0.0.1", "example.org", "127.0.0.1.evil"],
+)
+def test_http_beyond_loopback_refuses_to_start_without_a_token(host: str) -> None:
+    with pytest.raises(ValidationError, match="auth_token is required"):
+        Settings(transport="http", http_host=host)
+    assert Settings(transport="http", http_host=host, auth_token=TOKEN).auth_token is not None
+
+
+def test_stdio_ignores_the_bind_address() -> None:
+    assert Settings(transport="stdio", http_host="0.0.0.0").transport == "stdio"
+
+
+@pytest.mark.parametrize("empty", ["", "   ", "\n"])
+def test_an_empty_token_counts_as_no_token(empty: str) -> None:
+    # An unset variable in a compose file or a secret mount arrives as an empty string.
+    assert Settings(auth_token=empty).auth_token is None
+    with pytest.raises(ValidationError, match="auth_token is required"):
+        Settings(transport="http", http_host="0.0.0.0", auth_token=empty)
+
+
+@pytest.mark.parametrize("weak", ["short", "a" * 15, "has a space in it, long enough", "tökén" * 6])
+def test_a_weak_or_unusable_token_is_refused_and_never_echoed(weak: str) -> None:
+    with pytest.raises(ValidationError) as e:
+        Settings(auth_token=weak)
+    shown = str(e.value.errors(include_input=False, include_url=False))  # as the CLI prints it
+    assert "auth_token" in str(e.value) and weak not in shown
+
+
+def test_a_token_is_trimmed_and_never_shows_in_the_settings_text() -> None:
+    s = Settings(auth_token=f"{TOKEN}\n")
+    assert s.auth_token is not None and s.auth_token.get_secret_value() == TOKEN
+    assert TOKEN not in repr(s) and TOKEN not in str(s)
+
+
+def test_the_token_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WEFT_TRANSPORT", "http")
+    monkeypatch.setenv("WEFT_HTTP_HOST", "0.0.0.0")
+    monkeypatch.setenv("WEFT_AUTH_TOKEN", TOKEN)
+    s = Settings()
+    assert s.auth_token is not None and s.auth_token.get_secret_value() == TOKEN
+
+
+@pytest.mark.parametrize("port", [0, -1, 65536])
+def test_the_port_must_be_a_real_port(port: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(http_port=port)
+
+
+def test_the_transport_is_one_of_two() -> None:
+    with pytest.raises(ValidationError):
+        Settings(transport="sse")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("secret", ["", "   "])
+def test_an_empty_secret_string_is_no_token(secret: str) -> None:
+    """Settings built in code can pass a SecretStr, which a check that only reads str skips."""
+    assert Settings(auth_token=SecretStr(secret)).auth_token is None
+    with pytest.raises(ValidationError, match="auth_token is required"):
+        Settings(transport="http", http_host="0.0.0.0", auth_token=SecretStr(secret))
+
+
+def test_a_weak_secret_string_is_refused() -> None:
+    with pytest.raises(ValidationError):
+        Settings(auth_token=SecretStr("short"))
+
+
+def test_a_good_secret_string_is_kept() -> None:
+    s = Settings(auth_token=SecretStr(TOKEN))
+    assert s.auth_token is not None and s.auth_token.get_secret_value() == TOKEN

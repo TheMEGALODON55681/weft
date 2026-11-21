@@ -4,11 +4,13 @@ The TOML path comes from WEFT_CONFIG (the CLI's --config sets it), falling back 
 ./weft.toml when that exists. Unknown keys are rejected so a typo fails loudly.
 """
 
+import ipaddress
 import os
+import re
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Self
 
-from pydantic import Field, SecretStr, ValidationInfo, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -17,6 +19,21 @@ from pydantic_settings import (
 )
 
 from weft import __version__
+
+# printable ASCII with no space, which is what fits in an `Authorization: Bearer` header
+_TOKEN = re.compile(r"[\x21-\x7e]{16,}")
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for `localhost` and the loopback addresses. Anything else, a name included, is
+    treated as reachable from elsewhere, so a doubtful value fails closed."""
+    host = host.strip().strip("[]").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class Settings(BaseSettings):
@@ -105,6 +122,44 @@ class Settings(BaseSettings):
     llm_extraction: bool = False  # extract falls back to a model when the rules find too little
     llm_max_input_chars: int = Field(default=30_000, gt=0)  # of page text sent to the model
     provider_timeout_s: float = Field(default=60.0, gt=0)
+
+    # The transport. stdio is for a client that launches Weft. http serves streamable HTTP at /mcp
+    # for remote connectors, with /healthz beside it. Bound beyond loopback, http needs a bearer
+    # token, and the server refuses to start without one.
+    transport: Literal["stdio", "http"] = "stdio"
+    http_host: str = "127.0.0.1"
+    http_port: int = Field(default=8000, ge=1, le=65535)
+    auth_token: SecretStr | None = None
+
+    @field_validator("auth_token", mode="before")
+    @classmethod
+    def _usable_token(cls, value: Any) -> Any:
+        """An empty token is no token: an unset variable in a compose file or a secret mount
+        arrives as an empty string and must not become a password. The message never holds the
+        value."""
+        if isinstance(value, SecretStr):  # settings built in code may pass one
+            value = value.get_secret_value()
+        if not isinstance(value, str):
+            return value
+        value = value.strip()
+        if not value:
+            return None
+        if not _TOKEN.fullmatch(value):
+            raise ValueError("must be at least 16 printable ASCII characters with no spaces")
+        return value
+
+    @model_validator(mode="after")
+    def _remote_needs_a_token(self) -> Self:
+        if (
+            self.transport == "http"
+            and self.auth_token is None
+            and not _is_loopback_host(self.http_host)
+        ):
+            raise ValueError(
+                "auth_token is required when http_host is not a loopback address "
+                "(set WEFT_AUTH_TOKEN)"
+            )
+        return self
 
     @field_validator("embedding_base_url", "llm_base_url")
     @classmethod

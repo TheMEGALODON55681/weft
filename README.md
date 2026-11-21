@@ -6,7 +6,7 @@ It also crawls. Give it seed URLs and a goal in plain language ("find pricing pa
 
 It can also answer a question about a site. `search_in_site` crawls toward the question and returns the best passages, each with the URL and a snippet. `extract` pulls structured data out of a page, or out of every page of a crawl, as JSON that validates against a schema you write, using CSS and XPath selectors. Two optional extras, both off by default, rerank search hits by meaning and let a language model read a page when the selectors find too little.
 
-This repository is at Phase 5 of 7. Eight tools run over stdio: `fetch_page`, `crawl_site`, `get_job`, `cancel_job`, `list_jobs`, `map_site`, `search_in_site` and `extract`. The remote transport comes next. [docs/Phases.md](docs/Phases.md) lists what each phase adds.
+This repository is at Phase 6 of 7. Eight tools run over stdio, and over streamable HTTP behind a bearer token for remote connectors: `fetch_page`, `crawl_site`, `get_job`, `cancel_job`, `list_jobs`, `map_site`, `search_in_site` and `extract`. A Dockerfile packages the HTTP server. Load tests and fuzzing come next. [docs/Phases.md](docs/Phases.md) lists what each phase adds.
 
 ## Install
 
@@ -18,6 +18,8 @@ python -m venv .venv
 ```
 
 For development, install the extras: `pip install -e ".[dev]"`.
+
+The repository ships a `uv.lock`. `uv sync --frozen --extra dev` installs the exact versions the tests ran against, and the Docker image installs the same set. `pyproject.toml` holds `fastmcp` to the 4.x series, since the HTTP transport depends on its auth and host-check options.
 
 Rendering JavaScript pages needs a headless Chromium, which is a separate download of about 290 MB on disk:
 
@@ -33,9 +35,9 @@ Without it Weft still works. `render="auto"` returns the page as fetched, and `r
 .venv/bin/weft                      # Windows: .venv\Scripts\weft.exe
 ```
 
-`python -m weft` does the same. The server speaks MCP over stdio, so it prints nothing and waits for a client. It accepts two flags: `--config PATH` for a TOML settings file and `--version`.
+`python -m weft` does the same. The server speaks MCP over stdio, so it prints nothing and waits for a client. It accepts `--config PATH` for a TOML settings file, `--version`, and three flags for the HTTP transport: `--transport stdio|http`, `--host` and `--port`. See [Run remotely](#run-remotely).
 
-stdout carries the protocol and nothing else. Logs are JSON lines on stderr.
+Under stdio, stdout carries the protocol and nothing else. Logs are JSON lines on stderr, from Weft and from the HTTP server alike.
 
 ## Connect an MCP client
 
@@ -53,6 +55,79 @@ Add Weft to any client that launches stdio servers. Use the absolute path to the
 ```
 
 On Windows the command is `C:\\path\\to\\weft\\.venv\\Scripts\\weft.exe`. Set `WEFT_CONTACT` to an address or URL where site operators can reach you. Weft puts it in the User-Agent header.
+
+## Run remotely
+
+`weft --transport http` serves MCP over streamable HTTP at `/mcp`, with a health check at `/healthz`. Use it when the client connects to a URL and cannot start a process on your machine.
+
+Weft does not terminate TLS. Put a reverse proxy with a certificate in front of it and publish the proxy, never Weft's own port. The proxy must pass responses through without buffering, because progress notifications stream while a call runs. Its read timeout must exceed your longest `wait_s`, which is 300 seconds at most.
+
+**1. Make a token.** It is the only credential, and Weft reads it from the environment.
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+**2. Start the server.**
+
+```bash
+export WEFT_AUTH_TOKEN=...          # the token from step 1
+export WEFT_CONTACT=you@example.org
+.venv/bin/weft --transport http --host 0.0.0.0 --port 8000
+```
+
+Bound beyond loopback, Weft refuses to start without a token and exits with code 2. A token needs at least 16 printable ASCII characters, and an empty variable counts as no token.
+
+On `127.0.0.1`, `::1` or `localhost` the token is optional. Without one, Weft checks the `Host` and `Origin` headers, so a web page open in your browser cannot reach the server by pointing its own name at your machine. Every program on that machine can still call it, so keep the token on for anything shared. With a token, Weft skips the header check, which lets a proxy on the same machine forward requests under your public host name.
+
+**3. Check it.**
+
+```bash
+curl https://weft.example.org/healthz           # {"status":"ok"}
+curl -i -X POST https://weft.example.org/mcp    # 401 and a WWW-Authenticate: Bearer header
+```
+
+**4. Attach the client.** Weft needs a client that speaks streamable HTTP and can send an `Authorization: Bearer <token>` header. The endpoint is `https://weft.example.org/mcp`. Most clients that read a JSON file take this shape:
+
+```json
+{
+  "mcpServers": {
+    "weft": {
+      "url": "https://weft.example.org/mcp",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
+    }
+  }
+}
+```
+
+Clients that add servers from a command line take the same three values (a name, the URL and the header) as arguments. Check your client's documentation for the flag names.
+
+A connector form that offers only OAuth or no authentication cannot send a static header. Use a client that can, or put a gateway in front of Weft that holds the token and handles that client's login. List the tools once the client is attached: you should see the eight listed under [Tools](#tools).
+
+To rotate the token, change the variable and restart the server. Sessions end at a restart and clients open new ones. Jobs survive it, as they do under stdio. Every holder of the token has the same access, including crawling and reading cached pages, because Weft has one token and no caller identity.
+
+### Docker
+
+```bash
+docker build -t weft .
+docker run --rm --init -p 8000:8000 \
+  -e WEFT_AUTH_TOKEN -e WEFT_CONTACT \
+  -v weft-data:/data \
+  --memory 2g --pids-limit 512 \
+  --cap-drop ALL --security-opt no-new-privileges \
+  weft
+```
+
+`-e NAME` with no value passes the variable from your shell, so the token stays out of the command line and the shell history. Anyone who can run `docker inspect` on the container can still read it.
+
+The image starts from `python:3.12-slim-bookworm`, installs the locked dependencies (`uv sync --frozen`) and `chromium-headless-shell` with its system libraries, and runs as the unprivileged user `weft` (uid 10001). It listens on port 8000 on every interface, keeps the database in the `/data` volume, and checks `/healthz` every 30 seconds. Without `WEFT_AUTH_TOKEN` the container exits at once with code 2, because it binds beyond loopback. A bind-mounted data directory must be writable by uid 10001.
+
+- `--init` reaps the child processes Chromium leaves behind when a tab crashes.
+- `--memory` caps everything Chromium allocates. `browser_js_heap_mb` caps only a page's JavaScript.
+- Playwright starts Chromium with its own sandbox off, and Weft keeps that default. The container takes the sandbox's place as the boundary, which is why the run command drops every capability.
+- Leave `allow_loopback` off.
+
+To run the test suite inside the image: `docker build --target test -t weft-test . && docker run --rm weft-test`.
 
 ## Tools
 
@@ -270,7 +345,7 @@ llm_model = "your-chat-model"
 Put keys in the environment (`WEFT_EMBEDDING_API_KEY`, `WEFT_LLM_API_KEY`) rather than the file.
 
 - **Rerank.** With `embedding_rerank` on, `search_in_site` embeds its query and its best 50 keyword hits, and orders them by the keyword rank and the similarity rank together (reciprocal rank fusion), so a strong keyword hit is not pushed out by a vague semantic one. It reorders the keyword hits. It does not find passages that share no word with the query. `score` is then the fused score, and `reranked` is `true`. If the provider fails, the keyword order is returned with `reranked: false`.
-- **Model extraction.** With `llm_extraction` on, `extract` asks the model about a page only when the selectors found too little to satisfy the schema, or the schema has none. The model gets the schema without its selectors, the page URL and the first `llm_max_input_chars` of the page's Markdown, and is told to treat the text as data. Its answer replaces the selectors' only if it validates against the schema. Otherwise the item stays `method: "rules"` and `errors` gains an `llm:` line. One call asks the model about at most 10 pages.
+- **Model extraction.** With `llm_extraction` on, `extract` asks the model about a page only when the selectors found too little to satisfy the schema, or the schema has none. The model gets the schema without its selectors, the page URL and the first `llm_max_input_chars` of the page's Markdown, and is told to treat the text as data. Its answer replaces the selectors' only if it validates against the schema. Otherwise the item stays `method: "rules"` and `errors` gains an `llm:` line. A page whose status is 400 or higher is never sent: the rules still run, and the item gets the line `llm: skipped, the page answered with status 404`. One call asks the model about at most 10 pages.
 
 Weft sends nothing to a model unless the flag is on. When it is on, text from the pages you search or extract goes to that endpoint. The endpoint is set here and cannot be chosen by an agent, and it is not checked by the address guard, because an operator who points Weft at a server on their own network means to. A provider error never reaches the agent with a key or a response body in it.
 
@@ -299,6 +374,10 @@ Weft fetches whatever URL an agent gives it, and the agent may have picked that 
 Each render gets a proxy of its own. It stops relaying once the page and everything it loads have used `render_max_bytes`, and refuses new connections after that. It also spaces new connections to each host by `render_host_interval_s`, so one page cannot open a burst of connections to a site.
 
 Chromium cannot resolve names itself, cannot skip the proxy for loopback addresses, and cannot send WebRTC traffic around it. Service workers are blocked. Each render gets a fresh browser context, so no cookie or storage carries over to the next page. The browser sends the same honest User-Agent as plain fetches.
+
+**Remote access.** Over HTTP, every request to `/mcp` needs `Authorization: Bearer <token>`. Weft hashes the presented token and the configured one with SHA-256 and compares the digests with `hmac.compare_digest`, so the comparison reveals neither how much of a guess was right nor how long the real token is. A missing, wrong or malformed token gets `401` and a `WWW-Authenticate: Bearer` header before any tool code runs, so a stranger causes no fetch, no job and no database read. A token in the URL is ignored. Weft logs a rejected token as `bearer token rejected`, without the token, and turns the HTTP access log off so that a secret in a query string cannot reach it.
+
+`/healthz` needs no token. It answers `{"status":"ok"}`, or `503 {"status":"unavailable"}` when one `SELECT 1` does not finish in two seconds, and it tells a stranger nothing more. The address check, robots.txt, pacing and the breaker apply to remote callers as they do to local ones. Keep `allow_loopback` off on a server others can reach: with it on, a token holder can reach every service on the machine.
 
 Page content is still untrusted. These controls limit where Weft can be pointed. They do not stop a fetched page from carrying text meant to steer the agent that reads it.
 
@@ -355,6 +434,10 @@ max_links = 100
 | `llm_api_key` | none | Sent as a bearer token when set. Redacted from logs. Better set as `WEFT_LLM_API_KEY`. |
 | `llm_max_input_chars` | `30000` | Characters of a page's Markdown sent to the model. |
 | `provider_timeout_s` | `60` | Wall-clock limit for one call to either endpoint. |
+| `transport` | `stdio` | `stdio` or `http`. The `--transport` flag overrides it. |
+| `http_host` | `127.0.0.1` | Address the HTTP server binds. Beyond loopback it needs `auth_token`, or Weft refuses to start. The `--host` flag overrides it, and the Docker image sets `0.0.0.0`. |
+| `http_port` | `8000` | Port of the HTTP server, 1 to 65535. The `--port` flag overrides it. |
+| `auth_token` | none | Bearer token for `/mcp`: 16 or more printable ASCII characters, no spaces. Redacted from logs. Set it as `WEFT_AUTH_TOKEN` and keep it out of the file. |
 
 Each setting has an environment variable named `WEFT_` plus the uppercase setting name, for example `WEFT_MAX_LINKS`.
 
@@ -363,7 +446,13 @@ Each setting has an environment variable named `WEFT_` plus the uppercase settin
 - Weft reads HTML and XHTML. PDFs, JSON and images return `unsupported_content_type`, and a crawl records them as failures under that code.
 - The browser starts on the first page that needs it, which adds a second or two to that call. It runs headless, and Weft closes it when the server stops.
 - Rendering limits are per page: `browser_js_heap_mb` caps a page's JavaScript, not its images or layout memory. Memory for one Chromium is roughly `browser_max_pages` pages plus the browser's own overhead.
-- The browser's internal proxy listens on a loopback port. Another program on the same machine could use it, but only to reach addresses Weft would fetch anyway.
+- The browser's internal proxy listens on a loopback port. Another program on the same machine could use it, but only to reach addresses Weft would fetch anyway. In the Docker image, only Weft and Chromium share that interface, and published ports do not reach it.
+- Weft speaks plain HTTP. Without a TLS proxy in front, the token crosses the network in clear text.
+- There is one token and no caller identity. Every holder shares the page cache, the jobs and their results. Queued jobs are not capped, so a holder can queue crawls until the disk fills.
+- HTTP sessions live in memory. A restart ends them and clients open new ones.
+- `/healthz` needs no token and runs one trivial query per request.
+- Chromium runs without its own sandbox, which is Playwright's default. Run it in the container, as above, and not as a privileged user.
+- The Docker image names its base by tag, not by digest, and the system libraries come from Debian when you build.
 - Cookies are neither stored nor sent. Authenticated crawling will take cookies per job.
 - Pacing is per host name and per process. `example.com` and `www.example.com` are separate hosts, and two Weft processes do not share a limit. Two servers on one data directory would also both resume the same jobs, so run one per directory.
 - A page that hangs the extractor frees the caller after `extract_timeout_s`, but the worker thread cannot be stopped. Four stuck pages switch extraction off until they finish or the server restarts.
@@ -385,13 +474,15 @@ Each setting has an environment variable named `WEFT_` plus the uppercase settin
 ## Development
 
 ```bash
-pytest                  # about four minutes, includes a real stdio round trip and a killed crawl
+pytest                  # about four minutes, includes a real stdio round trip, a server process on
+                        # a local port and a killed crawl
 ruff check .
 ruff format --check .
 mypy                    # strict, covers src/weft
+uv lock --check         # fails when pyproject.toml and uv.lock disagree
 ```
 
-Tests never touch the internet. They run against a small local web server in `tests/fixture_site.py`, so the suite runs with `allow_loopback` on and spacing off. The tests for the address guard and the limiter turn those back to their defaults. The browser tests start a real headless Chromium and need `chromium-headless-shell` installed. Without it they are skipped, in `tests/test_browser.py` and `tests/test_page.py` alike.
+Tests never touch the internet. They run against a small local web server in `tests/fixture_site.py`, so the suite runs with `allow_loopback` on and spacing off. The HTTP tests start a server on a free loopback port, and one of them starts `python -m weft` as a child process. `tests/test_docker.py` checks the Dockerfile as text and runs its health check against a real server. It builds no image. The tests for the address guard and the limiter turn those back to their defaults. The browser tests start a real headless Chromium and need `chromium-headless-shell` installed. Without it they are skipped, in `tests/test_browser.py` and `tests/test_page.py` alike.
 
 Playwright is pinned to one minor release in `pyproject.toml`, because each release drives its own Chromium build. After raising the pin, run `playwright install chromium-headless-shell` again.
 

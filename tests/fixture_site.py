@@ -483,6 +483,7 @@ ROUTES: dict[str, Callable[[BaseHTTPRequestHandler], None]] = {
         "<body><p>Привет, мир</p></body></html>".encode("windows-1251"),
         ctype="text/html",
     ),
+    "/status/400": lambda h: _send(h, b"<html><title>Bad</title></html>", status=400),
     "/status/404": lambda h: _send(h, b"<html><title>Gone</title></html>", status=404),
     "/status/500": lambda h: _send(h, b"oops", status=500, ctype="text/plain"),
     "/empty": lambda h: _send(h, b""),

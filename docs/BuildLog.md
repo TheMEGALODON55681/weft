@@ -498,3 +498,109 @@ Close the Phase 4 gap: an end-to-end crawl test that fails when anchor text
 stops steering the order. Add cssselect, lxml and jsonschema as
 dependencies. Docs updated.
 ```
+
+## Phase 6: remote transport (2026-11-21)
+
+### Done
+
+Streamable HTTP beside stdio, bearer-token auth, `/healthz`, a Dockerfile and a lockfile. `weft --transport http` serves `/mcp` and `/healthz`. stdio stays the default and is unchanged. New files: `server/auth.py`, `Dockerfile`, `.dockerignore`, `uv.lock`, `tests/test_http.py` and `tests/test_docker.py`. Four new settings (`transport`, `http_host`, `http_port`, `auth_token`), three CLI flags, and 685 tests, 84 more than at the end of Phase 5. No dependency was added, and `fastmcp` is now held to the 4.x series. Nothing was committed, tagged or pushed. The image was never built (see Verification).
+
+The request was a remote transport with bearer auth, `/healthz` and Docker, plus two extras: a lockfile with a pin on `fastmcp`, and no model call for a page that answered with an error status. That second item closes the Phase 5 decision that declined a status check because nothing asked for it.
+
+### Verification
+
+- `pytest`: 685 passed in 220 seconds, no skips, no warnings.
+- `ruff check .` and `ruff format --check .` (77 files): clean
+- `mypy` (strict, 43 files): clean
+- `uv lock --check`: the lock holds 99 packages and agrees with `pyproject.toml`.
+- `uv build`: sdist (84 files) and wheel. The wheel holds `server/auth.py` and no tests. The sdist holds no `.handoff` directory, no `.env` file and no database.
+- The built wheel, installed into a fresh virtual environment, ran `weft --version` from site-packages. Then `weft --transport http` ran as a child process on a loopback port. `--host 0.0.0.0` with no token exited with code 2 and a message that names `auth_token`. With a token, `/healthz` returned 200 `{"status":"ok"}` with `Cache-Control: no-store`. `/mcp` returned 401 with `WWW-Authenticate: Bearer` for no token and for a wrong one, and an `initialize` request with the right token returned 200. After the process was killed, stdout held no bytes and the token was not in stderr.
+- Real sockets. `tests/test_http.py` runs the app under uvicorn on a free loopback port and sends raw requests. A table of bad `Authorization` values goes to `POST`, `GET` and `DELETE` on `/mcp`, and the fixture site's hit count shows that no fetch happened for a stranger. A token in the query string, under four parameter names, does not open the endpoint. A `fastmcp` client with the token lists the tools, fetches a page and runs a crawl with progress notifications. Two tests start `python -m weft`: one with a token, behind a foreign `Host` as a same-machine proxy would send it, and one without a token, where a foreign `Host` gets 421 and a foreign `Origin` gets 403. The first also stops the process with `CTRL_BREAK_EVENT` and checks stdout, the log format and that neither the token nor a query-string secret reaches stderr. uvicorn re-raises the signal after its cleanup, so the exit status on Windows is 3.
+- Constant-time comparison. A spy on `hmac.compare_digest` shows one call per attempt with two 32-byte digests. No test can time a comparison reliably, so that is as far as the claim goes.
+- Mutation checks. 37 hand-written mutants of the Phase 6 code in six groups: the verifier (7), `/healthz` and the auth wiring (6), settings (9), the CLI (8), logging (4) and the error-page skip (3). Each is written into the source file in place and run against the tests meant to catch it. The unmutated selection must pass first, and a `finally` block restores the file. The SHA-256 of all 43 source files matched before and after. The first run caught 34. Two mutants hung and one did not apply, and all three were problems in my own work (see Problems hit). After the fixes all 37 are caught. Two more were considered and not run: a `/healthz` that answers before the server is ready (the port is not open until the lifespan has run, so no request can see it) and an error-page skip that does not use up one of the ten model calls (no tool path can observe it).
+- The Dockerfile. Its two `uv sync` steps ran in a scratch environment on Windows and installed the project as a wheel. `tests/test_docker.py` runs the `HEALTHCHECK` command from the file against a healthy server, a server that answers 503 and a closed port, with a proxy variable set that the probe must ignore. It checks as text that the runtime stage is last and unprivileged, that the headless shell and its libraries are installed, that every `uv sync` is frozen, that uv is pinned and that no token is in the image.
+- Environment. `.venv` was synced to the lock with `uv sync --frozen --extra dev`. That moved `fastmcp` from 4.2.2 to 4.2.4 and eleven other packages by a patch release. The full suite passed on that set.
+- Processes. After the last run there is no `python`, `chrome`, `playwright`, `docker` or `weft` process of mine. Two `node.exe` and ten `msedge.exe` processes remain, which I did not start.
+- Not verified. **No container was built or run.** There is no Docker, Podman or Docker Desktop on this machine, so the Debian package step, the browser download, `--cap-drop ALL`, `--init`, `--memory`, the `test` stage, writes to `/data` as uid 10001 and the suite on Linux are all untested. The `SIGTERM` branch of the child-process tests and the POSIX `creationflags` path have not run. No third-party MCP client or hosted connector was tried, so the README's client steps follow the common configuration shape and nothing more. The claim that Playwright launches Chromium with its sandbox off comes from the documented default and the bundled driver's source, not from watching a launch.
+
+### Decisions
+
+- **fastmcp's own HTTP path.** `FastMCP.run(transport="http")` builds the Starlette app and runs uvicorn on it, and the same `build_server` serves stdio and HTTP. Writing the ASGI layer by hand would have meant keeping Weft's own copy of session handling.
+- **One bearer token, from the environment.** There is one operator and one secret, so there is no OAuth, no per-client token and no expiry. The cost is that every holder has the same access and rotating means a restart. Both are listed under Limits in the README.
+- **`BearerToken` instead of fastmcp's `StaticTokenVerifier`.** The stock verifier does not compare in constant time. Ours hashes both sides with SHA-256 and compares the digests with `hmac.compare_digest`. Equal-length digests leak neither how many bytes matched nor the token's length, and hashing first lets a non-ASCII value through where `compare_digest` would raise on a `str`. The object holds only the digest.
+- **The refusal is in settings validation.** A model validator rejects `transport = "http"` with no token unless the host is loopback, so it fires when settings load and the process exits with code 2 before it has bound a port. Loopback means `localhost`, `127.0.0.0/8` and `::1`. A name, an empty string, `0.0.0.0` and `::` are not loopback, and neither is anything the parser cannot read, so a doubtful value fails closed. An empty or whitespace token is no token. A token needs 16 or more printable ASCII characters.
+- **The Host and Origin check is on only without a token.** On a tokenless loopback server it stops DNS rebinding and cross-origin requests from a page in the owner's browser. With a token it is off, because a reverse proxy on the same machine forwards requests under the public host name and the check would answer 421. The token is the defence there. Found in review and checked with real subprocesses.
+- **`/healthz` is open and says little.** One `SELECT 1` through `Database.run` under a two second timeout gives 200 `{"status":"ok"}`. A timeout, an exception, or no server state (before startup ends or after shutdown starts) gives 503 `{"status":"unavailable"}`, and the cause goes to the log only. Both answers carry `Cache-Control: no-store`.
+- **One log format.** The `uvicorn`, `fastmcp` and `mcp` loggers use the same JSON handler as `weft`, because each of them formats its own lines otherwise. uvicorn's `color_message` copy is dropped. The access log is off and `log_config` is `None`, so a secret in a query string cannot reach it.
+- **The Dockerfile has three stages.** `base` installs the locked dependencies in two `uv sync` steps (dependencies first, so that layer changes only when the lock does) and then the project as a wheel, which means the `test` stage tests what `runtime` runs. `runtime` is last, so a plain `docker build` makes it. The user is `weft` (uid 10001), data lives in the `/data` volume, and the image holds no token, so a container started without `WEFT_AUTH_TOKEN` exits with code 2. The health check is a Python one-liner with an empty proxy map.
+- **Chromium keeps Playwright's default of no sandbox.** The container is the boundary, so the README's run command drops every capability. Documented in Limits.
+- **A lockfile and a pin.** `uv.lock` makes the image and the tests install the same versions. `fastmcp` is held to `>=4.2.2,<5` because the transport depends on its auth and host-check options.
+- **An error page never reaches the model.** A page with a status of 400 or more still runs through the selectors, and the item gains `llm: skipped, the page answered with status N`. This replaces the Phase 5 note that said the cost was a wasted model call.
+
+### Problems hit
+
+- **Two mutants hung and one did not apply.** The hang had two causes in my tests. The `/healthz` failure tests called `monkeypatch.undo()` after their assertions. When an assertion failed, `Database.run` stayed patched, shutdown hung on `db.close()` and the harness hit its timeout. They use `with monkeypatch.context()` now. The second cause showed up on the rerun: with the health timeout removed, one request never finished and uvicorn's graceful shutdown waited for it. The `serve` helper sets `timeout_graceful_shutdown`, so that mutant now fails the test with a read timeout. The third mutant did not apply because `ruff format` had turned the validator's condition into a multi-line `if (`, and the harness string still matched the old line.
+- **A line of fastmcp's log was formatted by Rich.** It went to stderr as coloured text and would have broken any log pipeline that parses every line. Routing the loggers through one handler fixed it, and a test checks that each of the three writes JSON.
+- **A header of `Bearer ` with a trailing space cannot be sent.** The HTTP client will not send it, so the table of bad headers uses `Bearer` alone.
+- **pydantic's error text repeats the input.** `str()` of a validation error includes `input_value`, which for a token is the token. The CLI prints each error's field and message only, with no `loc` prefix for a model-level error, and tests check that the value never appears.
+- **The harness's output was buffered.** A background run printed nothing for minutes. `python -u` fixes it.
+- **A large shell heredoc broke on quotes again.** File content goes through the editor tools.
+
+### Review
+
+I reviewed the code in this session from four angles (correctness, security, concurrency, maintainability) and reconciled the findings. Then I ran an over-engineering review, and a self-check of the final diff.
+
+Fixed:
+
+- **A `SecretStr` token skipped the checks.** Found by the correctness pass. `Settings(auth_token=SecretStr(""))`, built in code, got past the empty and length rules that a string gets. The validator unwraps the secret first, with a test.
+- **`BearerToken("")` would have admitted an empty bearer.** Found by the security pass. The constructor refuses an empty token.
+- **The Host check answered 421 behind a same-machine proxy.** Found by the correctness pass. It is off when a token is set (see Decisions).
+- **No test showed that the access log stays off.** A test sends a secret in a query string and checks that stderr never holds it.
+- **Self-check.** The README named a particular coding tool as an example client, which breaks the rule against tool and vendor names. Removed. A search for such names over the README, docs, source, tests, Dockerfile and `pyproject.toml` is clean. The two `monkeypatch.undo()` tests are in Problems hit. A private helper lost its public name (`_is_loopback_host`). A docs claim that no tool path can observe was dropped.
+- **Over-engineering review.** Kept: `BearerToken` over the stock verifier (constant time), and the `test` stage and `tests/test_docker.py` (the image cannot be built here, so the text checks stand in for it). Declined with a reason: `/readyz` (one health check answers both questions), metrics, per-client tokens and OAuth (one operator), TLS inside Weft (a reverse proxy does it better), a token file or `secrets_dir` (an environment variable does the job), a rate limit on wrong tokens (a proxy can add one, and the token has 16 or more characters), a `--path` flag, and a cap on queued jobs (no caller identity, so a cap would be global).
+
+Accepted and recorded, not fixed:
+
+- No image was built. See Verification for the list of what that leaves untested.
+- No real MCP client or hosted connector was tried. Some connector forms offer only OAuth or no authentication, and the README says so.
+- One token and no caller identity. Every holder shares the cache, the jobs and their results, and queued jobs are not capped.
+- No TLS, and no limit on wrong tokens. A proxy does both.
+- `/healthz` is open and queries the database through its one thread, so a flood of probes queues behind the crawl's writes.
+- The base image is named by tag, and Debian's packages are not pinned.
+- Chromium runs without its own sandbox.
+- `server/app.py` imports `starlette` directly, and the tests import `uvicorn` and `mcp`. None is declared in `pyproject.toml`. They arrive with `fastmcp`, so the `<5` pin covers them, and the lock records the versions.
+- The name `localhost` counts as loopback without being resolved. A hosts file that maps it elsewhere would expose a tokenless server to that address.
+- The claim that only Weft and Chromium share the container's loopback interface is reasoning, and stated as such in the docs. It is not a test.
+- Phase 2 to 5 carry-overs unchanged.
+
+The jury was one reviewer playing four roles again. The parts most worth an outside read are `server/auth.py` with the token and loopback checks in `config.py`, and the Dockerfile on a real build.
+
+### Commit message draft
+
+```
+Phase 6: streamable HTTP transport, bearer auth and Docker
+
+Add weft --transport http, which serves MCP over streamable HTTP at /mcp
+and a health check at /healthz through fastmcp and uvicorn. stdio stays the
+default. The new settings are transport, http_host, http_port and
+auth_token, with --transport, --host and --port flags.
+
+Require a bearer token on /mcp when one is set, compared as SHA-256 digests
+with hmac.compare_digest. A missing or wrong token gets 401 before any tool
+code runs. Refuse to start with exit code 2 when the bind address is not
+loopback and there is no token, and treat any host that cannot be read as
+loopback as remote. With no token on loopback, check Host and Origin to stop
+DNS rebinding. /healthz is open and runs SELECT 1 under a two second limit.
+
+Send the uvicorn, fastmcp and mcp logs through the JSON handler and turn the
+access log off, so a secret in a query string cannot reach it.
+
+Add a Dockerfile with base, test and runtime stages: an unprivileged user,
+headless Chromium with its libraries, a locked install, a health check, a
+data volume and no token in the image. Add uv.lock and hold fastmcp to the
+4.x series.
+
+Close a Phase 5 gap: a page with an error status is never sent to the model.
+The image was not built, because the build machine has no container runtime.
+Docs updated.
+```

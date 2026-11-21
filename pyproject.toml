@@ -9,7 +9,9 @@ description = "Goal-directed web crawler and in-site search, served to AI agents
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "fastmcp",
+    # One major release, from the version the tests ran against. The HTTP transport leans on
+    # fastmcp's auth and host-check options, which changed between majors.
+    "fastmcp>=4.2.2,<5",
     "httpx[http2]",
     "httpcore>=1.0,<1.1",
     "pydantic-settings",

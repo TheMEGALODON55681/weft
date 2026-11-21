@@ -529,6 +529,24 @@ async def test_an_llm_answer_that_breaks_the_schema_does_not_replace_what_the_ru
         assert "(root): 'salary' is a required property" in item["errors"]  # reasons stay
 
 
+@pytest.mark.parametrize("path", ["/status/400", "/status/404", "/status/500"])
+async def test_an_error_page_is_never_sent_to_the_model(
+    path: str, site: FixtureSite, tmp_path: Path
+) -> None:
+    llm = FakeLlm(json.dumps({"title": "Gone", "salary": 1}))
+    async with Client(build_server(llm_settings(tmp_path), llm=llm)) as client:
+        r = (
+            await client.call_tool("extract", {"url_or_job": site.url(path), "schema": ROLE})
+        ).structured_content
+    assert r is not None
+    assert llm.calls == []
+    (item,) = r["items"]
+    assert item["method"] == "rules" and item["valid"] is False
+    *reasons, note = item["errors"]
+    assert reasons  # what the rules found wrong stays, and the note comes after it
+    assert note.startswith("llm: skipped") and path[-3:] in note
+
+
 async def test_a_schema_with_no_rules_is_for_the_model_alone(
     site: FixtureSite, settings: Settings, tmp_path: Path
 ) -> None:

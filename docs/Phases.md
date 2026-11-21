@@ -9,7 +9,7 @@ Build order is fixed. Each phase is finished, tested and documented before the n
 | 3 | Rendering: Playwright pool, auto-escalation policy | Done |
 | 4 | Crawling: frontier, goal scoring, dedupe, `crawl_site`, `map_site`, jobs, resume | Done |
 | 5 | Retrieval: passage ranking, `search_in_site`, schema `extract`, optional rerank and model extraction | Done |
-| 6 | Remote: streamable HTTP transport, bearer auth, Docker, `/healthz` | Not started |
+| 6 | Remote: streamable HTTP transport, bearer auth, Docker, `/healthz` | Done, with the image unbuilt (see Phase 6) |
 | 7 | Hardening: load test, fuzzing, docs polish | Not started |
 
 ## Phase 1: done
@@ -71,8 +71,8 @@ Delivered:
 Left for later:
 
 - Sub-resources are not paced and have no byte budget per render, only a time budget. Closed in Phase 4: each render has its own proxy, with a byte budget and connection spacing per host.
-- The proxy on loopback has no authentication. It only reaches addresses the guard allows. Phase 4 made the per-render proxies short-lived, but the browser-wide one remains. Phase 6 should check this inside the container, where other processes share the loopback interface.
-- `browser_js_heap_mb` caps JavaScript, not DOM, image or GPU memory. A child-process memory limit (a job object on Windows, cgroups in Docker) would be the hard cap. Phase 6 for Docker.
+- The proxy on loopback has no authentication. It only reaches addresses the guard allows. Phase 4 made the per-render proxies short-lived, but the browser-wide one remains. Phase 6 should check this inside the container, where other processes share the loopback interface. Phase 6 reasoned about it and could not test it: the container's network namespace holds only Weft and Chromium, and a published port does not reach loopback.
+- `browser_js_heap_mb` caps JavaScript, not DOM, image or GPU memory. A child-process memory limit (a job object on Windows, cgroups in Docker) would be the hard cap. Closed for Docker in Phase 6: the README's run command sets `--memory` and `--pids-limit`. A bare host still has no hard cap.
 - The path that replaces a browser whose context will not close has no test, because nothing in the fixture makes `close` hang.
 - The render tests in `tests/test_page.py` failed instead of skipping without Chromium. Closed in Phase 4.
 - Playwright was allowed to float across minor releases, each of which needs its own Chromium build. Closed in Phase 4: pinned to 1.65.
@@ -100,7 +100,7 @@ Left for later:
 - Near-duplicate detection compares against every kept page: linear in the size of the crawl. Fine for thousands of pages. Bucketing by bit bands is the upgrade.
 - The pattern-run cap stops long legitimate pagination after ten pages in a row. A crawl that needs page 50 of a listing has to seed it.
 - Jobs, frontier rows and cache rows are never deleted. Needs a retention setting. Phase 7.
-- The number of queued jobs is unbounded. Phase 6 needs a cap per caller before the server goes on a network.
+- The number of queued jobs is unbounded. Phase 6 needs a cap per caller before the server goes on a network. Still open after Phase 6, with a reason: see below.
 - The page cache is shared by all callers, which is safe only while Weft sends no cookies. Authenticated crawls must partition or skip it.
 - `Cache-Control: no-store` is not honoured by the page cache.
 - Sitemaps with namespace prefixes on their tags (`<s:loc>`) are not read.
@@ -141,5 +141,39 @@ Left for later:
 - A model cannot be stopped from putting misleading page text into a field that takes any string. Validation against the schema is the only bound.
 - Model and embedding endpoints are not covered by the address guard. They are operator-set. If Weft ever takes endpoints from a caller, they need it.
 - The extraction calls of one `extract` call run in sequence.
-- A page with an error status is run through the selectors, and through the model if that is on, like any other page.
+- A page with an error status is run through the selectors, and through the model if that is on, like any other page. Closed in Phase 6: the selectors still run, and the model is never asked about a page with a status of 400 or more.
 - Phase 4 carry-overs are unchanged.
+
+## Phase 6: done
+
+Delivered:
+
+- The streamable HTTP transport beside stdio: `weft --transport http` serves `/mcp` and `/healthz` through fastmcp and uvicorn. The flags `--transport`, `--host` and `--port` set the new settings `transport`, `http_host` and `http_port`, and the same settings come from `WEFT_*` variables and the file.
+- Bearer-token auth (`server/auth.py`). The token comes from `WEFT_AUTH_TOKEN`. Weft compares SHA-256 digests with `hmac.compare_digest`. A missing, wrong or malformed token gets `401` and a `WWW-Authenticate: Bearer` header before any tool code runs, on `POST`, `GET` and `DELETE`. A token in the URL is ignored. A rejected token is logged without its value.
+- The server refuses to start beyond loopback without a token, at settings validation and with exit code 2. An empty token counts as none, a token under 16 characters or with a space is refused, and no error repeats the value.
+- A server bound to loopback with no token checks the `Host` and `Origin` headers, which stops DNS rebinding and cross-origin requests from a web page. A server with a token does not, so a proxy on the same machine can forward under another host name.
+- `/healthz`, open, with a fixed body: `ok`, or `503` when `SELECT 1` does not finish in two seconds or the server is not ready.
+- One JSON format on stderr for Weft, uvicorn, fastmcp and the MCP SDK. The access log is off.
+- A `Dockerfile` with three stages (`base`, `test`, `runtime`). `runtime` is the default, runs as the unprivileged user `weft`, installs `chromium-headless-shell` with its libraries, installs only what `uv.lock` says, exposes 8000, keeps data in `/data`, has a health check and exits with code 2 when started without a token. `.dockerignore` keeps the repository's local state and secrets out of the context. The `test` stage runs the suite against the installed package.
+- `uv.lock`, and `fastmcp` held to `>=4.2.2,<5`. The local environment was synced to the lock, which moved `fastmcp` from 4.2.2 to 4.2.4 and eleven other packages by a patch release, and the suite passed on that set.
+- README steps for running the server, putting TLS in front, attaching a client, and running the image.
+- Closed a Phase 5 gap: an error page is never sent to the model.
+- 685 tests, 84 of them new, and strict types and lint clean. 37 hand-made mutants of the Phase 6 code are all caught. Details are in BuildLog.
+
+What was not done, and why:
+
+- **The image was never built and the suite never ran in a container.** There is no Docker, Podman or Docker Desktop on the machine this phase was built on, and installing one was out of scope. What stands in for it: the Dockerfile's two `uv sync` steps ran in a scratch environment on Windows and installed the project as a wheel, the `HEALTHCHECK` command is run by a test against a real server, and tests pin each requirement of the file (non-root user, headless shell, locked install, no secret). None of that proves the Debian package step, the browser download or `--cap-drop ALL`. Build the image on a machine with Docker before relying on it. `docker build --target test -t weft-test . && docker run --rm weft-test` runs the suite there.
+- No hosted connector or third-party MCP client was tried. The HTTP side was exercised with a `fastmcp` client and with raw requests. The README's client steps follow the common configuration shape and have not been run.
+- Chromium and Linux behaviour of the whole suite is unverified beyond what ran on Windows.
+
+Left for later:
+
+- A cap on queued jobs. Phase 4 asked for one per caller. The server has one shared token and no caller identity, so a cap would be global, and one token holder could fill it for everyone. It waits until there is more than one holder to protect.
+- Per-client tokens, expiry and revocation. Rotating the one token means a restart, which ends every session.
+- Weft serves plain HTTP. TLS is the reverse proxy's job.
+- No rate limit or lockout on wrong tokens. A proxy can add one.
+- `/healthz` queries the database without a token, and a wedged database makes each probe queue behind it.
+- Playwright starts Chromium with its sandbox off. The container is the boundary in the image.
+- The image names its base by tag, and Debian's packages are not pinned.
+- The loopback check trusts the name `localhost` without resolving it. A hosts file that maps it elsewhere would expose a tokenless server to that address.
+- Phase 7: HTTP/2 through the guarded transport, a load test, fuzzing, retention for jobs and cache rows, and the remaining carry-overs from Phases 2 to 5.

@@ -1,0 +1,25 @@
+# Only what the build copies should reach the daemon. Dockerfile copies pyproject.toml, uv.lock,
+# README.md, src and tests; everything else stays out.
+.git
+.handoff
+.venv
+.github
+docs
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+build
+dist
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# local runtime state and secrets
+*.db
+*.db-wal
+*.db-shm
+weft.toml
+.env
+.env.*
