@@ -18,6 +18,7 @@ from weft.fetch.errors import FetchError
 ROBOTS_AGENT = "weft"
 MAX_ROBOTS_BYTES = 512_000  # RFC 9309 asks crawlers to read at least 500 KiB
 _UNREACHABLE_TTL_S = 60.0
+MAX_SITEMAP_LINES = 50
 
 Fetch = Callable[[str], Awaitable[tuple[int, bytes]]]
 
@@ -47,6 +48,7 @@ def _matches(pattern: str, path: str) -> bool:
 class Rules:
     rules: tuple[tuple[bool, str], ...] = ()  # (allow, pattern)
     crawl_delay: float | None = None
+    sitemaps: tuple[str, ...] = ()  # Sitemap: lines, which belong to no group
 
     def allows(self, path: str) -> bool:
         """`path` is the request target: path plus query. The longest matching rule wins and
@@ -77,13 +79,17 @@ def _delay(value: str) -> float | None:
 def parse_robots(text: str) -> Rules:
     """The rules that apply to Weft: its own groups if the file names it, else the `*` groups."""
     groups: list[_Group] = []
+    sitemaps: list[str] = []
     reading_agents = False
     for line in text.lstrip("﻿").splitlines():
         name, colon, value = line.split("#", 1)[0].partition(":")
         if not colon:
             continue
         name, value = name.strip().lower(), value.strip()
-        if name == "user-agent":
+        if name == "sitemap":
+            if value and len(sitemaps) < MAX_SITEMAP_LINES:
+                sitemaps.append(value)
+        elif name == "user-agent":
             if not reading_agents:
                 groups.append(_Group())
             groups[-1].agents.add(value.lower())
@@ -100,7 +106,12 @@ def parse_robots(text: str) -> Rules:
     return Rules(
         tuple(rule for g in mine for rule in g.rules),
         next((g.delay for g in mine if g.delay is not None), None),
+        tuple(dict.fromkeys(sitemaps)),
     )
+
+
+def _origin(url: httpx.URL) -> str:
+    return f"{url.scheme}://{url.netloc.decode()}"
 
 
 @dataclass(slots=True)
@@ -131,8 +142,13 @@ class RobotsCache:
         self._max_hosts = max_hosts
         self._entries: OrderedDict[str, _Entry] = OrderedDict()
 
+    def cached(self, url: httpx.URL) -> Rules | None:
+        """The origin's rules if they are already known and current. Never reads the file."""
+        entry = self._entries.get(_origin(url))
+        return entry.rules if entry is not None and self._clock() < entry.expires else None
+
     async def rules_for(self, url: httpx.URL) -> Rules:
-        origin = f"{url.scheme}://{url.netloc.decode()}"
+        origin = _origin(url)
         entry = self._entries.get(origin)
         if entry is None:
             entry = self._entries[origin] = _Entry()

@@ -5,6 +5,10 @@ is resolved here, every address is checked, and the connection goes to a checked
 HTTPS and WebSockets arrive as CONNECT and become byte tunnels. Plain HTTP arrives with an
 absolute URL and is forwarded in origin form with `Connection: close`, one request per client
 connection, so a second request can never ride a connection that was checked for another host.
+
+A proxy can carry a byte budget, counted on what comes back from upstream: once it is spent,
+every relay stops and new connections are refused. It can also space new connections to one
+host. The browser pool starts one such proxy per render.
 """
 
 import asyncio
@@ -16,10 +20,12 @@ from urllib.parse import urlsplit
 import httpcore
 
 from weft.fetch.errors import FetchError
+from weft.fetch.limits import HostLimiter
 
 log = logging.getLogger("weft.fetch")
 
 MAX_HEAD_BYTES = 64 * 1024
+_CLOSE_WAIT_S = 1.0
 _CHUNK = 64 * 1024
 # Headers that describe the hop to the proxy, not the request. Host is rewritten from the URL.
 _DROP = frozenset(
@@ -78,12 +84,23 @@ class GuardedProxy:
         backend: httpcore.AsyncNetworkBackend,
         connect_timeout_s: float,
         idle_timeout_s: float = 60.0,
+        max_bytes: int | None = None,
+        host_interval_s: float = 0.0,
     ) -> None:
         self._backend = backend
         self._connect_timeout = connect_timeout_s
         self._idle_timeout = idle_timeout_s
+        self._max_bytes = max_bytes
+        self._interval = host_interval_s
+        self._pacer = HostLimiter(per_host=1, overall=1)  # only its spacing is used
         self._server: asyncio.Server | None = None
         self._conns: set[asyncio.Task[None]] = set()
+        self._closed = False
+        self.bytes_down = 0  # bytes relayed from upstream to the client
+
+    @property
+    def budget_spent(self) -> bool:
+        return self._max_bytes is not None and self.bytes_down >= self._max_bytes
 
     async def start(self) -> int:
         """Listen on a free loopback port and return it."""
@@ -93,17 +110,30 @@ class GuardedProxy:
         return int(self._server.sockets[0].getsockname()[1])
 
     async def aclose(self) -> None:
-        """Stop listening and end every open connection, tunnels included."""
+        """Stop listening and end every open connection, tunnels included. Quick even when
+        clients hold idle connections open, as Chromium does with sockets it preconnects."""
         if self._server is None:
             return
+        self._closed = True
         self._server.close()
+        # A connection can be accepted with its handler task created but not started. Let those
+        # start: they see the flag and leave, instead of waiting for a request that never comes.
+        await asyncio.sleep(0)
         for task in self._conns:
             task.cancel()
         await asyncio.gather(*self._conns, return_exceptions=True)
-        await self._server.wait_closed()
+        # Since Python 3.12 this waits for every accepted connection to be released. With the
+        # handlers gone that is immediate; the bound covers a socket accepted but not yet handed
+        # to a handler, which will see the flag when it is.
+        with suppress(TimeoutError):
+            async with asyncio.timeout(_CLOSE_WAIT_S):
+                await self._server.wait_closed()
         self._server = None
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self._closed:
+            writer.close()
+            return
         task = asyncio.current_task()
         if task:  # start_server always runs this in a task
             self._conns.add(task)
@@ -172,10 +202,17 @@ class GuardedProxy:
         self, host: str, port: int, writer: asyncio.StreamWriter
     ) -> httpcore.AsyncNetworkStream | None:
         """Connect through the guard, or answer the client with why not and return None."""
+        if self.budget_spent:
+            await _reply(writer, 403, "the byte budget for this page is spent")
+            return None
         try:
+            if self._interval:
+                wait = self._pacer.reserve(host.lower(), self._interval, self._idle_timeout)
+                await asyncio.sleep(wait)
             return await self._backend.connect_tcp(host, port, timeout=self._connect_timeout)
         except FetchError as exc:
-            await _reply(writer, 403 if exc.code == "blocked_address" else 502, str(exc))
+            status = {"blocked_address": 403, "rate_limited": 503}.get(exc.code, 502)
+            await _reply(writer, status, str(exc))
         except httpcore.ConnectTimeout:
             await _reply(writer, 504, f"timed out connecting to {host}")
         except (httpcore.ConnectError, OSError, ValueError):
@@ -197,7 +234,12 @@ class GuardedProxy:
                     await upstream.write(chunk)
 
         async def down() -> None:
-            while chunk := await upstream.read(_CHUNK, timeout=self._idle_timeout):
+            while not self.budget_spent and (
+                chunk := await upstream.read(_CHUNK, timeout=self._idle_timeout)
+            ):
+                if self._max_bytes is not None:
+                    chunk = chunk[: self._max_bytes - self.bytes_down]
+                self.bytes_down += len(chunk)
                 writer.write(chunk)
                 await writer.drain()
 

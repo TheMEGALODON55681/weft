@@ -8,8 +8,10 @@ The browser makes no connection of its own:
   hop at a time, so robots.txt, host spacing, the breaker and the address guard apply to it as to
   any plain fetch. A redirect is handed to the browser as a refresh to the next URL, so the next
   hop is a new navigation and comes back here too.
-- Everything else (scripts, images, XHR, WebSockets, workers) goes through GuardedProxy, which
-  checks the address of every connection. Chromium is told not to bypass the proxy for
+- Everything else (scripts, images, XHR, WebSockets, workers) goes through a GuardedProxy of the
+  render's own, which checks the address of every connection, spaces new connections to each
+  host and stops relaying once the render's byte budget is spent. Chromium is told not to bypass
+  the proxy for
   loopback, not to resolve names itself, and not to send WebRTC traffic around it. Service
   workers are blocked: they outlive the page and their requests escape request routing.
 
@@ -24,7 +26,14 @@ from contextlib import suppress
 from dataclasses import dataclass
 
 import httpcore
-from playwright.async_api import Browser, Playwright, Request, Route, async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Playwright,
+    Request,
+    Route,
+    async_playwright,
+)
 from playwright.async_api import Error as PlaywrightError
 
 from weft.config import Settings
@@ -77,8 +86,14 @@ class BrowserPool:
     ) -> None:
         self._settings = settings
         self._fetcher = fetcher
+        self._backend = proxy_backend or GuardedBackend(
+            httpcore.AnyIOBackend(), settings.allow_loopback
+        )
+        # The browser-wide proxy. Every context sets a proxy of its own (see _render), so this
+        # one only catches traffic that belongs to no context. Chromium on Windows needs a
+        # browser-wide proxy for per-context proxies to work at all.
         self._proxy = GuardedProxy(
-            proxy_backend or GuardedBackend(httpcore.AnyIOBackend(), settings.allow_loopback),
+            self._backend,
             connect_timeout_s=settings.connect_timeout_s,
             idle_timeout_s=settings.read_timeout_s,
         )
@@ -196,40 +211,62 @@ class BrowserPool:
 
     async def _render(self, inst: _Instance, res: FetchResult) -> Rendered:
         s = self._settings
-        ctx = await inst.browser.new_context(
-            service_workers="block", accept_downloads=False, user_agent=s.user_agent
+        proxy = GuardedProxy(
+            self._backend,
+            connect_timeout_s=s.connect_timeout_s,
+            idle_timeout_s=s.read_timeout_s,
+            max_bytes=s.render_max_bytes,
+            host_interval_s=s.render_host_interval_s,
         )
         try:
-            document = [res]  # handed out once, to the first navigation
-
-            async def route(route: Route, request: Request) -> None:
-                with suppress(PlaywrightError):  # the context may close mid-request
-                    if not request.is_navigation_request():
-                        await route.continue_()  # through the guarded proxy
-                    elif document:
-                        doc = document.pop()
-                        await route.fulfill(
-                            status=doc.status, content_type=_content_type(doc), body=doc.body
-                        )
-                    else:
-                        await self._navigate(route, request)
-
-            await ctx.route("**/*", route)
-            page = await ctx.new_page()
-            page.set_default_timeout(s.render_timeout_s * 1000)
-            await page.goto(res.final_url, wait_until="load")
-            with suppress(PlaywrightError):
-                await page.wait_for_load_state("networkidle", timeout=_SETTLE_MS)
-            dom = await page.content()
-            final_url = page.url
-        finally:
+            port = await proxy.start()
+            ctx = await inst.browser.new_context(
+                service_workers="block",
+                accept_downloads=False,
+                user_agent=s.user_agent,
+                proxy={"server": f"http://127.0.0.1:{port}", "bypass": "<-loopback>"},
+            )
             try:
-                async with asyncio.timeout(_CLOSE_TIMEOUT_S):
-                    await ctx.close()
-            except (TimeoutError, PlaywrightError):
-                inst.broken = True
+                dom, final_url = await self._load(ctx, res)
+            finally:
+                try:
+                    async with asyncio.timeout(_CLOSE_TIMEOUT_S):
+                        await ctx.close()
+                except (TimeoutError, PlaywrightError):
+                    inst.broken = True
+        finally:
+            await proxy.aclose()
+        if proxy.budget_spent:
+            log.info(
+                "render byte budget spent",
+                extra={"url": safe_url(res.final_url), "bytes": proxy.bytes_down},
+            )
         cap = s.max_body_bytes
-        return Rendered(final_url, dom[:cap], len(dom) > cap)
+        return Rendered(final_url, dom[:cap], len(dom) > cap or proxy.budget_spent)
+
+    async def _load(self, ctx: BrowserContext, res: FetchResult) -> tuple[str, str]:
+        s = self._settings
+        document = [res]  # handed out once, to the first navigation
+
+        async def route(route: Route, request: Request) -> None:
+            with suppress(PlaywrightError):  # the context may close mid-request
+                if not request.is_navigation_request():
+                    await route.continue_()  # through the guarded proxy
+                elif document:
+                    doc = document.pop()
+                    await route.fulfill(
+                        status=doc.status, content_type=_content_type(doc), body=doc.body
+                    )
+                else:
+                    await self._navigate(route, request)
+
+        await ctx.route("**/*", route)
+        page = await ctx.new_page()
+        page.set_default_timeout(s.render_timeout_s * 1000)
+        await page.goto(res.final_url, wait_until="load")
+        with suppress(PlaywrightError):
+            await page.wait_for_load_state("networkidle", timeout=_SETTLE_MS)
+        return await page.content(), page.url
 
     async def _navigate(self, route: Route, request: Request) -> None:
         """Fetch one hop of a navigation the way a plain fetch would, or refuse it."""

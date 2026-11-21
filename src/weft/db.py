@@ -55,6 +55,53 @@ _MIGRATIONS = [
     );
     CREATE INDEX pages_content_hash ON pages(content_hash);
     """,
+    # Version 2: the first consumers. Nothing ever wrote to frontier or pages, so both are
+    # rebuilt in the shape the crawler and the page cache need.
+    """
+    ALTER TABLE jobs ADD COLUMN stop_reason TEXT;  -- max_pages | time_budget | exhausted
+    ALTER TABLE jobs ADD COLUMN run_s REAL NOT NULL DEFAULT 0;  -- time spent running, all runs
+
+    DROP TABLE frontier;
+    CREATE TABLE frontier (
+        job_id        TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        url           TEXT NOT NULL,  -- canonical form
+        depth         INTEGER NOT NULL,
+        score         REAL NOT NULL,  -- priority while pending
+        parent_url    TEXT,
+        anchor_text   TEXT,
+        run           INTEGER NOT NULL DEFAULT 0,  -- ancestors in a row with this URL's pattern
+        -- pending | fetching | done | duplicate | failed
+        state         TEXT NOT NULL,
+        discovered_at REAL NOT NULL,
+        fetched_at    REAL,
+        final_url     TEXT,
+        status        INTEGER,
+        title         TEXT,
+        snippet       TEXT,
+        relevance     REAL,  -- the fetched page against the goal, 0 to 1
+        content_hash  TEXT,
+        simhash       INTEGER,  -- signed 64-bit
+        duplicate_of  TEXT,
+        error         TEXT,   -- FetchError code
+        bytes         INTEGER,
+        elapsed_ms    REAL,
+        cached        INTEGER,
+        PRIMARY KEY (job_id, url)
+    ) WITHOUT ROWID;
+    CREATE INDEX frontier_next ON frontier(job_id, state, score DESC, discovered_at);
+
+    DROP TABLE pages;
+    CREATE TABLE pages (
+        url           TEXT NOT NULL,  -- canonical form of the requested URL
+        render        TEXT NOT NULL,  -- the render mode it was fetched with
+        result        TEXT NOT NULL,  -- PageResult as JSON
+        etag          TEXT,
+        last_modified TEXT,
+        fetched_at    REAL NOT NULL,
+        expires_at    REAL NOT NULL,
+        PRIMARY KEY (url, render)
+    ) WITHOUT ROWID;
+    """,
 ]
 SCHEMA_VERSION = len(_MIGRATIONS)
 

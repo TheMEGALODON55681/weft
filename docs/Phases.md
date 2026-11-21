@@ -7,8 +7,8 @@ Build order is fixed. Each phase is finished, tested and documented before the n
 | 1 | Skeleton: config, logging, SQLite schema, `fetch_page` over plain HTTP, stdio MCP server, tests | Done |
 | 2 | Safety and politeness: robots.txt, rate limits, SSRF guard, retries, circuit breaker | Done |
 | 3 | Rendering: Playwright pool, auto-escalation policy | Done |
-| 4 | Crawling: frontier, goal scoring, dedupe, `crawl_site`, `map_site`, jobs, resume | Next |
-| 5 | Retrieval: passage ranking, `search_in_site`, schema `extract` | Not started |
+| 4 | Crawling: frontier, goal scoring, dedupe, `crawl_site`, `map_site`, jobs, resume | Done |
+| 5 | Retrieval: passage ranking, `search_in_site`, schema `extract` | Next |
 | 6 | Remote: streamable HTTP transport, bearer auth, Docker, `/healthz` | Not started |
 | 7 | Hardening: load test, fuzzing, docs polish | Not started |
 
@@ -30,8 +30,8 @@ Gaps Phase 1 left, and what became of them:
 - The README warned that there was no SSRF guard. Removed in Phase 2, once the guard and its tests were in.
 - HTTP/2 is configured but no test exercises it. Phase 2 added a TLS fixture, but it speaks HTTP/1.1 over TLS, so HTTP/2 still needs a server that negotiates `h2`. Still open, Phase 7.
 - `render="always"` returned `render_unavailable`. Closed in Phase 3.
-- The `jobs`, `frontier` and `pages` tables exist and nothing uses them. Phases 4 and 5.
-- Conditional requests and the TTL page cache. Phase 4, when crawls repeat fetches.
+- The `jobs`, `frontier` and `pages` tables exist and nothing uses them. Closed in Phase 4, which migrated them to version 2.
+- Conditional requests and the TTL page cache. Closed in Phase 4.
 
 ## Phase 2: done
 
@@ -51,11 +51,11 @@ Left for later:
 
 - HTTP/2 through the guarded transport is untested. The TLS fixture exists but does not negotiate `h2`. Phase 7.
 - A page that hangs extraction frees the caller but not the thread. Running extraction in a child process that can be killed is the fix. Phase 7, if it shows up in load tests.
-- Per-host state in the limiter and breaker is never evicted. Needs an LRU once crawls span many hosts. Phase 4.
-- Limits are per host name. Two names for one server are not merged. Phase 4 can key on the resolved address if that matters.
+- Per-host state in the limiter and breaker is never evicted. Closed in Phase 4: an LRU that never drops a busy host.
+- Limits are per host name. Two names for one server are not merged. Phase 4 did not need it. Still open, Phase 7 if load tests show aliases matter.
 - robots.txt matching compares paths as sent, without percent-encoding normalisation. Rare in practice. Phase 7.
-- The `Sitemap:` lines in robots.txt are ignored. `map_site` will want them. Phase 4.
-- A wait longer than `total_timeout_s` is refused. A long crawl job will want its own, longer budget. Phase 4.
+- The `Sitemap:` lines in robots.txt are ignored. Closed in Phase 4.
+- A wait longer than `total_timeout_s` is refused. Closed in Phase 4: crawl fetches get `crawl_fetch_timeout_s`, and the job has `crawl_timeout_s`.
 
 ## Phase 3: done
 
@@ -70,21 +70,50 @@ Delivered:
 
 Left for later:
 
-- Sub-resources are not paced and have no byte budget per render, only a time budget. Phase 7 load tests will show whether that matters.
-- The proxy on loopback has no authentication. It only reaches addresses the guard allows. Phase 6 should check this inside the container, where other processes share the loopback interface.
+- Sub-resources are not paced and have no byte budget per render, only a time budget. Closed in Phase 4: each render has its own proxy, with a byte budget and connection spacing per host.
+- The proxy on loopback has no authentication. It only reaches addresses the guard allows. Phase 4 made the per-render proxies short-lived, but the browser-wide one remains. Phase 6 should check this inside the container, where other processes share the loopback interface.
 - `browser_js_heap_mb` caps JavaScript, not DOM, image or GPU memory. A child-process memory limit (a job object on Windows, cgroups in Docker) would be the hard cap. Phase 6 for Docker.
 - The path that replaces a browser whose context will not close has no test, because nothing in the fixture makes `close` hang.
+- The render tests in `tests/test_page.py` failed instead of skipping without Chromium. Closed in Phase 4.
+- Playwright was allowed to float across minor releases, each of which needs its own Chromium build. Closed in Phase 4: pinned to 1.65.
 - A rendered page runs without the origin's response headers, Content-Security-Policy included, so its DOM can differ from what a real visitor sees.
 - Rendering repeats the HTTP/2 gap: the proxy speaks HTTP/1.1 to Chromium, while upstream HTTPS is a byte tunnel that Chromium negotiates itself.
 
-## Phase 4: next
+## Phase 4: done
 
-Scope: the frontier, goal scoring, dedupe, `crawl_site`, `map_site`, jobs and resume.
+Delivered:
 
-Starting points left by Phases 2 and 3:
+- URL canonicalisation (`frontier/canon.py`): case, trailing dots, IDN, default ports, dot segments, percent-encoding, query order, tracking parameters and fragments.
+- A SQLite frontier (`frontier/store.py`), best score first, where every step commits on its own.
+- Goal scoring (`frontier/score.py`, `rank/bm25.py`): links scored by anchor text, URL words and the parent page's relevance, pages scored by BM25 against the goal. Breadth-first when there is no goal.
+- Dedupe: exact text hash, 64-bit simhash for near duplicates, `<link rel="canonical">`, and redirect targets as aliases.
+- Trap limits: depth, page budget, at most ten links in a row with their parent's URL pattern, no repeated path segments, a URL length cap.
+- `crawl_site`, `get_job`, `cancel_job`, `list_jobs` over MCP, with progress notifications, per-job metrics (pages, bytes, errors by code, latency percentiles, running time), a slot limit on running jobs, and resume after a stop or a kill.
+- `map_site`: robots.txt `Sitemap:` lines or `/sitemap.xml`, sitemap indexes, gzip sitemaps, links on the start page, and a robots verdict per URL.
+- A page cache in SQLite with a TTL and `ETag` and `Last-Modified` revalidation, used by `fetch_page`, crawls and `map_site`.
+- Carried gaps closed: an LRU for limiter and breaker state, a crawl time budget separate from `total_timeout_s`, render tests that skip without Chromium, Playwright pinned to its minor release, and a byte budget and connection spacing for each render's sub-resources.
+- 461 tests, ruff and strict mypy clean, wheel builds. 26 hand-made mutants of the Phase 4 code are all caught by the tests.
 
-- Per-host limiter and breaker state is never evicted. A crawl needs an LRU.
-- A wait longer than `total_timeout_s` is refused. A crawl job wants its own, longer budget.
-- `map_site` will want the `Sitemap:` lines of robots.txt, which are ignored today.
-- `get_page` already reports `fetch_method`, so the page cache can store which path produced a page. Rendering costs seconds, so the cache should keep rendered results.
-- A crawl that renders should share the one `BrowserPool`, whose `browser_max_pages` then caps how many crawl pages render at once.
+Left for later:
+
+- Relevance uses BM25 corpus statistics gathered during the crawl. A resumed job starts them again, so scores before and after a restart differ a little.
+- Near-duplicate detection compares against every kept page: linear in the size of the crawl. Fine for thousands of pages. Bucketing by bit bands is the upgrade.
+- The pattern-run cap stops long legitimate pagination after ten pages in a row. A crawl that needs page 50 of a listing has to seed it.
+- Jobs, frontier rows and cache rows are never deleted. Needs a retention setting. Phase 7.
+- The number of queued jobs is unbounded. Phase 6 needs a cap per caller before the server goes on a network.
+- The page cache is shared by all callers, which is safe only while Weft sends no cookies. Authenticated crawls must partition or skip it.
+- `Cache-Control: no-store` is not honoured by the page cache.
+- Sitemaps with namespace prefixes on their tags (`<s:loc>`) are not read.
+- `same_domain_only` treats `www.` as the same site and every other subdomain as a different one. A public-suffix-aware site key would be more exact.
+- Two servers on one data directory would both resume the same jobs.
+
+## Phase 5: next
+
+Scope: passage ranking, `search_in_site`, schema `extract`.
+
+Starting points left by Phase 4:
+
+- `rank/bm25.py` holds BM25 with a growing corpus and a small stemmer. Passage ranking can reuse it on passages instead of pages.
+- `search_in_site` can run as a crawl job with the query as its goal. The pages it keeps are in the frontier, and their full text is in the page cache.
+- `extract(url_or_job, schema)` can read a job's pages from the cache by URL, as `fetch_page` does after a crawl.
+- The cache is keyed by render mode. A search that renders differently from the crawl that filled the cache will fetch again.

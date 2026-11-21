@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -87,3 +88,100 @@ async def test_real_stdio_transport_round_trip(site: FixtureSite, tmp_path: Path
     assert result.structured_content["title"] == "Pricing and plans"
     assert json.dumps(result.structured_content)  # fully serialisable
     assert (tmp_path / "data" / "weft.db").exists()
+
+
+# --- Phase 4 tools -------------------------------------------------------------------------
+
+
+async def test_the_crawl_tools_are_listed(settings: Settings) -> None:
+    async with Client(build_server(settings)) as client:
+        tools = {t.name: t for t in await client.list_tools()}
+    assert {"crawl_site", "get_job", "cancel_job", "list_jobs", "map_site"} <= set(tools)
+    crawl = tools["crawl_site"].input_schema
+    assert crawl["required"] == ["seed_urls"]
+    assert {"goal", "max_pages", "max_depth", "include_patterns", "exclude_patterns"} <= set(
+        crawl["properties"]
+    )
+    for name in ("get_job", "list_jobs", "map_site"):
+        assert tools[name].annotations is not None
+        assert tools[name].annotations.read_only_hint is True
+
+
+async def test_crawl_site_reports_progress_and_returns_ranked_pages(
+    site: FixtureSite, settings: Settings
+) -> None:
+    progress: list[float] = []
+
+    async def on_progress(done: float, total: float | None, _msg: str | None) -> None:
+        progress.append(done)
+
+    async with Client(build_server(settings), progress_handler=on_progress) as client:
+        result = await client.call_tool(
+            "crawl_site",
+            {
+                "seed_urls": [site.url("/site/")],
+                "goal": "pricing",
+                "max_pages": 6,
+                "wait_s": 30,
+            },
+        )
+        job = result.structured_content
+        assert job is not None
+        assert job["job"]["status"] == "done"
+        top = {p["url"].removeprefix(site.base) for p in job["pages"][:2]}
+        assert top == {"/site/pricing", "/site/pricing/enterprise"}
+        assert progress and progress == sorted(progress)
+
+        again = await client.call_tool("get_job", {"job_id": job["job"]["id"], "limit": 1})
+        assert again.structured_content is not None
+        assert len(again.structured_content["pages"]) == 1
+        listed = await client.call_tool("list_jobs", {})
+        assert listed.structured_content is not None
+        assert [j["id"] for j in listed.structured_content["jobs"]] == [job["job"]["id"]]
+        # The crawl filled the page cache, so the full text costs no second request. Both use
+        # the default render mode, which is part of the cache key.
+        hits = site.hits("/site/pricing")
+        page = await client.call_tool("fetch_page", {"url": site.url("/site/pricing")})
+        assert page.structured_content is not None
+        assert page.structured_content["cached"] is True
+        assert site.hits("/site/pricing") == hits
+
+
+async def test_unknown_jobs_and_bad_seeds_are_tool_errors(settings: Settings) -> None:
+    async with Client(build_server(settings)) as client:
+        with pytest.raises(ToolError, match="unknown_job"):
+            await client.call_tool("get_job", {"job_id": "nope"})
+        with pytest.raises(ToolError, match="unknown_job"):
+            await client.call_tool("cancel_job", {"job_id": "nope"})
+        with pytest.raises(ToolError, match="invalid_url"):
+            await client.call_tool("crawl_site", {"seed_urls": ["ftp://x.test/"]})
+
+
+async def test_a_restarted_server_resumes_its_job(site: FixtureSite, tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", host_min_interval_s=0.3)
+    async with Client(build_server(settings)) as client:
+        result = await client.call_tool(
+            "crawl_site",
+            {"seed_urls": [site.url("/site/")], "max_pages": 8, "render": "never", "wait_s": 1},
+        )
+        assert result.structured_content is not None
+        job_id = result.structured_content["job"]["id"]
+        assert result.structured_content["job"]["status"] == "running"
+    # The server stopped mid-crawl. A new one picks the job up at startup.
+    async with Client(build_server(Settings(data_dir=tmp_path / "data"))) as client:
+        for _ in range(100):
+            info = (await client.call_tool("get_job", {"job_id": job_id})).structured_content
+            assert info is not None
+            if info["job"]["status"] != "running":
+                break
+            await asyncio.sleep(0.1)
+    assert info["job"]["status"] == "done"
+    assert info["job"]["stats"]["pages_fetched"] == 8
+
+
+async def test_map_site_over_mcp(site: FixtureSite, settings: Settings) -> None:
+    async with Client(build_server(settings)) as client:
+        result = await client.call_tool("map_site", {"url": site.url("/site/")})
+    m = result.structured_content
+    assert m is not None
+    assert any(u["url"].endswith("/site/blog/1") and u["source"] == "sitemap" for u in m["urls"])

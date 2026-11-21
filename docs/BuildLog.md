@@ -268,3 +268,120 @@ Add a one-hop mode to Fetcher.fetch, five settings, Playwright as a
 dependency, proxy and browser tests that prove blocked hosts are never
 contacted, and docs.
 ```
+
+## Phase 4: crawling (2026-11-21)
+
+### Done
+
+The frontier, goal scoring, dedupe, trap limits, `crawl_site`, `map_site`, the job tools and resume, conditional requests and the page cache. Five carried gaps from Phases 2 and 3 are closed: an LRU for limiter and breaker state, a crawl time budget of its own, render tests that skip without Chromium, Playwright pinned to its minor release, and a byte budget and connection spacing for each render's sub-resources. Three new packages (`frontier/`, `jobs/`, `rank/`), `fetch/cache.py`, schema version 2, eight settings, five MCP tools, and 461 tests. Nothing was committed, tagged or pushed.
+
+### Verification
+
+- `pytest`: 461 passed in 176 seconds, no warnings. An earlier full run of 456 tests passed in 171 seconds with no warnings too. A run before those reported "2 warnings" that were never identified (see Problems hit).
+- `ruff check .` and `ruff format --check .`: clean
+- `mypy` (strict, `src/weft`): clean
+- `uv build`: sdist and wheel built. The wheel holds `frontier/` (6 files), `jobs/` (3), `rank/` (2) and `fetch/cache.py`, and its metadata requires `playwright>=1.65.2,<1.66`.
+- Real stdio. `python -m weft` started as a child process, driven by a client script against the fixture site. Six tools listed. A 15-page `crawl_site` for "pricing plans" ended `done` with `max_pages`: 10 pages ok, 3 duplicates, 2 failed (`http_404` and `unsupported_content_type`). The pricing section came first (`/site/pricing/enterprise` 0.54, `/site/pricing` 0.51, the home page 0.0). One progress notification arrived, because the crawl took less than the one-second reporting interval. `fetch_page` on a crawled page returned `cached: true`. `map_site` returned 16 URLs from 4 sitemap files, and `list_jobs` showed the job.
+- Kill and resume. `tests/test_crawl.py` starts a crawl in a child Python process, kills it (`TerminateProcess` on Windows) once three pages are in, opens the same database in the test, resumes the job and checks that it finishes all twelve pages with at most two fetched twice. A second test does the same through the MCP server: stop mid-crawl, start a new server on the same data directory, watch the job finish.
+- Traps. The fixture's endless archive and endless calendar were crawled with `max_pages=500` and `max_depth=20`, so neither budget could be what stopped them. The crawl ended by itself (`exhausted`) after eleven archive pages and at most 21 calendar pages, under 60 pages in all. The trap pages carry text that differs for every page, so dedupe could not be what ended them either.
+- Near duplicates. Of the pair one date apart and the copy with other spacing, exactly one is kept and the other two point to it.
+- Mutation checks. 25 hand-written mutants of the crawl, frontier, cache, limiter and proxy code, each applied in a scratch copy of `src` and `tests` and run against the tests meant to catch it. 21 were caught by the first run. Four survived, and each was a gap in the tests, not an equivalent mutant: the crawler never had its use of `repeats_segments` tested (only the function was); the exact text hash was redundant for every page the tests used, because simhash also catches an exact copy once a page has 30 words, so only a short page needs it; the time budget carried across restarts, a stated decision, had no test; and nothing reached the `WHERE status = 'running'` guard that keeps a late `done` from overwriting `cancelled`. Five tests close them (and a fixture page `/site/edge` with a looping path and two short pages of identical text). A fifth mutant, the saved running time dropping earlier runs, was added for one of them. All five are now caught, 26 of 26. The score test caught the removal of anchor text from link scoring, but `test_the_goal_is_crawled_first` does not.
+- Processes. After the last full run there is no `python` or `chrome-headless` process. Three `node.exe` processes remain, the same three that were running before this session started any test.
+- Not verified: Linux and Docker (Phase 6), crawls of more than a few hundred pages, and memory use under load (Phase 7).
+
+### Decisions
+
+- **Canonical form is what gets fetched.** The crawler fetches the canonical URL, not the link as written. One URL per page in the frontier, the cache and the results is worth more than the rare site that cares about query order. Path case, trailing slashes and `www.` are left alone, because servers do treat those differently.
+- **Every frontier step commits on its own.** A kill can leave only rows marked `fetching`, and the next run puts them back. There is no in-memory queue to lose. The cost is one small transaction per state change, which is nothing next to a fetch.
+- **Statistics are computed, not stored.** `get_job` aggregates the frontier rows on each call. Counters kept in memory or in the `jobs` row would need their own crash handling. The one exception is `run_s`, the running time, because it cannot be derived: it is written after every page.
+- **The job's time budget spans restarts.** `crawl_timeout_s` is running time summed across runs, so a job that keeps being restarted still ends.
+- **Crawl fetches get their own budget.** `Fetcher.fetch` takes `timeout_s`, which replaces `total_timeout_s` for both the request and the longest wait for the host's turn. An agent calling `fetch_page` still gets a fast `rate_limited`. A crawl gets `crawl_fetch_timeout_s`, two minutes by default, so a site with a `Crawl-delay` of a minute is crawled at that pace instead of failing every other page.
+- **Link scores use what is known before fetching.** Anchor text, URL words and the parent's relevance. No embeddings, no second fetch. Page relevance is BM25 against the goal with corpus statistics that grow as the crawl does. Those statistics are not saved. Rebuilding them on resume would mean storing term counts per page for a small gain in score stability.
+- **A small stemmer of my own.** Six suffix rules, enough for `pricing` to meet `price` and `salaries` to meet `salary`. A real stemmer would be a dependency for the same result on goal words.
+- **Traps are ended by shape, not by count per pattern.** I first meant to cap URLs per pattern, which would have cut off a blog with more than a few dozen posts. A cap on links in a row that share their parent's pattern stops calendars and endless archives, which chain, and leaves sibling links alone, which do not. Depth and the page budget bound the rest.
+- **The simhash threshold is set for short pages.** A test with random text showed a one-word change moving a 60-word page about 6 bits and a 300-word page about 3. The classic 3-bit threshold missed the fixture's near-duplicate pair at 5 bits. Unrelated texts sit around 32 bits apart, so 6 leaves a wide margin. Pages under 30 words use the exact hash only.
+- **A canonical link makes the page an alias, unless the target is an alias already.** Two pages naming each other would otherwise both be thrown away.
+- **robots.txt is checked at enqueue only from cache.** For a same-site crawl the rules are always cached after the first page, so disallowed links never take a slot. Reading robots.txt for every new host a page links to would cost more than it saves. The fetch checks again regardless.
+- **Cache keyed by render mode.** A page cached from a plain fetch must not answer a call that asked for a browser. The cost: a crawl and a `fetch_page` call share entries only when their `render` matches, which it does with the defaults.
+- **Error pages are results whatever their type.** A `404` with a plain-text body used to raise `unsupported_content_type`. That broke the rule that HTTP error statuses come back as results, and it made crawl metrics report missing pages as the wrong kind of failure.
+- **Sitemaps are read by pattern.** `<loc>` and `<lastmod>` by regular expression, never through an XML parser. There are no entities to expand, so a billion-laughs file is just text. The cost is sitemaps that prefix their tags with a namespace.
+- **A proxy per render.** Byte budgets and pacing need to know which render a connection belongs to. Playwright can give each context its own proxy, so each render starts a `GuardedProxy` on a fresh port and closes it when the render ends. The browser-wide proxy stays, because Chromium on Windows needs one for per-context proxies to work. It now only sees traffic that belongs to no context.
+- **Eviction never forgets a host that matters.** The limiter drops a host only when no request holds or waits for its slots and it is owed no spacing. The breaker drops only closed breakers. The cap can be passed while more hosts than that are busy, which is better than a crawl over many hosts quietly losing its pacing.
+- **Workers run in a TaskGroup.** See Review.
+- **A proxy's shutdown does not wait on idle clients.** See Problems.
+
+### Problems hit
+
+- **My scripted edits wrote CRLF again.** Python's `write_text` on Windows translates newlines. `ruff format` fixed the Python files it touched, but `ruff format --check` caught one module, and a byte scan found two docs. All three are LF again, and my later edits write bytes.
+- **Closing a proxy could hang until the render timed out.** `test_an_allowed_page_cannot_reach_blocked_hosts` failed in two of four full runs and about one run in four on its own, always as a 20 second render timeout. Attaching Playwright event listeners made it pass every time, so I logged plain timestamps instead. Every proxied connection had finished within half a second, the page had loaded and its context had closed, and then `GuardedProxy.aclose()` never returned. The likely trigger is an idle connection: Chromium can open sockets to a proxy before it needs them. When one had been accepted but its handler task had not started yet, `aclose` cancelled the handlers it knew about, the late one then started and waited for a request head that never came, and Python 3.12's `Server.wait_closed()` waited for it. Phase 3 never saw this inside a render, because its one proxy closed only at shutdown. The one mutation run in Phase 3 that hung for 300 seconds with no cause found was most likely this. A proxy test with idle raw sockets reproduces it every time. The fix: `aclose` sets a flag that a late handler checks first, yields once so late handlers start and leave, then cancels the rest, and bounds `wait_closed` at a second as a fallback. The fallback never fires in the tests (six rounds take 0.02 seconds). The browser pair then passed ten runs out of ten.
+- **A new host could evict itself.** The first LRU inserted the host and then evicted, so with every older host busy, the newest entry was the idle one dropped, and its reservation was lost. The test for "a host still owed spacing is kept" caught it. Eviction now makes room before inserting.
+- **Dedupe ended the trap before the trap limit did.** The first trap pages shared one paragraph, so page two was a near duplicate of page one and was never expanded. The test passed for the wrong reason. The trap pages now carry text that differs for every page, and the test shows the pattern-run cap at work.
+- **Two jobs created in the same clock tick sorted at random.** `time.time()` on Windows moves in steps of about 15 ms. `list_jobs` now breaks ties by insertion order.
+- **The kill test's child could not start.** It got a minimal environment, and `Path.home()` failed at import with no `USERPROFILE`. The child now inherits the test's environment, which conftest has already cleaned of the host's `WEFT_*` variables.
+- **A refused download looked like a success.** The byte budget test counted fetches that resolved, and a fetch the proxy refuses with a 403 still resolves. It now counts only `ok` responses. The proxy had been right all along.
+- **BM25 ranked the enterprise page above the pricing page** for the goal "pricing". It says "pricing" three times in 35 words. The test now checks that the pricing section leads, not which page of it.
+- **The first mutation harness could have reported a perfect score by accident.** It counted any non-zero pytest exit as a caught mutant, so a collection error, a timeout or an import from the real tree instead of the copy would all have looked like successes. It now checks that the scratch copy is what gets imported, requires every test selection to pass unmutated first, counts only a failing test as caught, and reports a hang or an error on its own line. It also reads and writes bytes, so the copy keeps its line endings.
+- **Two pytest warnings were never identified.** One full run reported "2 warnings". The run that would have named them was interrupted, and the two full runs since reported none. Nothing in `src` prints or warns on its own. The cause is unknown and the warnings did not come back. `addopts` already has `-ra`, so a run that shows them will name them.
+- **A test asserted a running time to the wrong precision.** `JobStats.run_s` is rounded to a tenth of a second, so a short crawl after 20 seconds of earlier runs reports exactly 20.0. The test checks `>= 20.0`, which still fails if the earlier time is dropped.
+
+### Review
+
+I reviewed the code in this session from four angles (correctness, security, concurrency, maintainability) and reconciled the findings, then ran an over-engineering review.
+
+Fixed:
+
+- **Workers outlived a failed job.** Found by the concurrency pass. The workers ran under `asyncio.gather`, which does not cancel the others when one raises. A crash in one worker marked the job failed while the rest kept fetching and writing rows. They now run in a `TaskGroup`. A test makes the second page raise and checks that the site sees nothing more. The job's error names the first exception, not `ExceptionGroup`.
+- **Any `TimeoutError` looked like the time budget.** The crawl caught `TimeoutError` around its whole run. It now asks the timeout whether it expired and re-raises otherwise.
+- **A shorter path did not help a pending URL.** Found by the correctness pass. A URL first found deep in the site kept its depth when a link from nearer the seed found it again, so `max_depth` could stop it from being expanded. A pending row now takes the higher score, the smaller depth and the shorter pattern run. Test added.
+- **Glob patterns had no length limit, and a seed could pass validation and then kill its job.** Found by the security pass. Patterns are capped at 500 characters and 50 per list. Seeds are canonicalised in the tool, so a URL the canonicaliser refuses is an `invalid_url` error at the call, not a failed job.
+- **`map_site` judged `allowed` by the wrong file.** It used the start origin's robots.txt for every URL on the site, including the `www.` sibling and the other scheme, which have files of their own. `allowed` now comes from the URL's own origin, and is `null` when that file has not been read.
+- **Over-engineering review.** Cut a per-pattern URL counter that the pattern-run design made unnecessary, a connection counter on the proxy that nothing read, and a `Frontier.patterns` method written for it. Kept: `CrawlDeps` (it is what a resumed job and the server share), the injected clock on `PageCache` (it replaces sleeping tests), `cached_robots_rules` next to `robots_rules` (one never touches the network), and `__len__` on the limiter and breaker (two lines, and the eviction tests need them).
+
+Accepted and recorded, not fixed:
+
+- Relevance statistics restart when a job resumes.
+- The near-duplicate scan is linear in the pages kept.
+- The pattern-run cap ends long pagination after ten pages in a row.
+- Jobs, frontier rows and cache rows are never deleted. Queued jobs are unbounded.
+- The page cache is shared by all callers and ignores `Cache-Control: no-store`.
+- Two servers on one data directory would both resume the same jobs.
+- Sitemaps with namespace prefixes are not read.
+
+The jury was again one reviewer playing four roles. The crawl's resume path and the per-render proxy are the parts most worth an outside read.
+
+### Commit message draft
+
+```
+Phase 4: goal-directed crawling, jobs, resume and the page cache
+
+Add a SQLite frontier taken best score first, with every step committed on
+its own so a killed crawl resumes where it stopped. Score links by anchor
+text, URL words and the parent page's BM25 relevance to the goal, and fall
+back to breadth-first with no goal. Canonicalise URLs before they are
+queued or cached.
+
+Skip exact duplicates by text hash, near duplicates by a 64-bit simhash,
+canonical aliases and redirect targets. Bound crawler traps by depth, page
+budget, a cap on links in a row that share their parent's URL pattern, and
+a refusal of repeated path segments and very long URLs.
+
+Add crawl_site, get_job, cancel_job and list_jobs over MCP, with progress
+notifications, per-job metrics, a limit on running jobs, a time budget that
+spans restarts, and resume at startup. Add map_site, which reads sitemaps
+from robots.txt Sitemap lines or /sitemap.xml, follows indexes and gzip
+files, and adds the start page's links.
+
+Add a page cache in SQLite with a TTL and ETag / Last-Modified
+revalidation, used by fetch_page and by crawls. Return error pages as
+results whatever their content type. Migrate the schema to version 2.
+
+Close gaps from Phases 2 and 3: evict per-host limiter and breaker state
+with an LRU that keeps busy hosts, give crawl fetches their own time
+budget, skip the render tests in test_page.py without Chromium, pin
+Playwright to 1.65, and give each render its own guarded proxy with a byte
+budget and connection spacing for sub-resources.
+
+Extend the fixture site with a crawlable site, two infinite link traps, a
+near-duplicate pair, a canonical alias and sitemaps, and test a real kill
+and resume. Docs updated.
+```

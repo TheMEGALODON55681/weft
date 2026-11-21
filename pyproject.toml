@@ -16,9 +16,10 @@ dependencies = [
     "selectolax",
     "trafilatura",
     "charset-normalizer",
-    # Each Playwright release drives one Chromium build. The browser itself is a separate
-    # download: `playwright install chromium-headless-shell`.
-    "playwright>=1.65,<2",
+    # Pinned to one minor release: each one drives its own Chromium build, so an upgrade
+    # means downloading a new browser. The browser itself is a separate download:
+    # `playwright install chromium-headless-shell`.
+    "playwright>=1.65.2,<1.66",
 ]
 
 [project.optional-dependencies]

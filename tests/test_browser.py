@@ -10,6 +10,7 @@ case carries a positive control that must reach the fixture by the same mechanis
 import asyncio
 import socket
 from collections.abc import AsyncIterator, Callable
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ import pytest
 
 from fixture_site import JS_SHELL_HTML, FixtureSite
 from weft.config import Settings
-from weft.fetch.browser import BrowserPool
+from weft.fetch.browser import BrowserPool, Rendered
 from weft.fetch.errors import FetchError
 from weft.fetch.http import Fetcher, FetchResult
 from weft.fetch.ssrf import GuardedBackend
@@ -285,3 +286,73 @@ async def test_a_closed_pool_starts_no_browser(site: FixtureSite, pool_with) -> 
     assert e.value.code == "render_unavailable"
     assert pool.launches == 1
     assert pool.open_browsers == 0
+
+
+# --- sub-resource budget and pacing -----------------------------------------------------------
+
+
+async def render_result(pool: BrowserPool, res: FetchResult) -> Rendered:
+    try:
+        return await pool.render(res)
+    except FetchError as exc:
+        if exc.code == "render_unavailable":
+            pytest.skip(f"headless Chromium is not installed: {exc}")
+        raise
+
+
+SEQUENTIAL_BLOBS = """<p id="out">0</p><script>
+(async () => {
+  let n = 0;
+  for (let i = 0; i < 10; i++) {
+    try {
+      const r = await fetch(`/blob/40000/${i}`);  // refused ones come back as 403
+      if (r.ok) { await r.arrayBuffer(); n++; }
+    } catch (e) {}
+    document.getElementById("out").textContent = String(n);
+  }
+  document.getElementById("out").textContent += " finished";
+})();
+</script>"""
+
+
+async def test_sub_resources_stop_when_the_byte_budget_is_spent(make_site, pool_with) -> None:
+    """Ten 40 kB downloads against a 100 kB budget: the third is cut short, and nothing after
+    it reaches the site."""
+    site = make_site()
+    pool, _ = pool_with(render_max_bytes=100_000)
+    shot = await render_result(pool, prefetched(site, SEQUENTIAL_BLOBS))
+    assert shot.truncated  # the budget is reported as truncation
+    assert " finished" in shot.html  # the page itself carried on
+    assert len(site.hits_under("/blob/")) == 3
+    loaded = int(shot.html.split('id="out">')[1].split(" ")[0])
+    assert loaded == 2
+
+
+async def test_a_generous_budget_changes_nothing(make_site, pool_with) -> None:
+    site = make_site()
+    pool, _ = pool_with()
+    shot = await render_result(pool, prefetched(site, SEQUENTIAL_BLOBS))
+    assert not shot.truncated
+    assert ">10 finished<" in shot.html
+
+
+PARALLEL_PINGS = """<script>
+Promise.allSettled([0, 1, 2, 3].map((i) => fetch(`/ping?i=${i}`)))
+  .then(() => { document.body.dataset.done = "1"; });
+</script>"""
+
+
+@pytest.mark.parametrize(("interval", "min_gap"), [(0.25, 0.2), (0.0, None)])
+async def test_new_connections_to_a_host_are_spaced(
+    make_site, pool_with, interval: float, min_gap: float | None
+) -> None:
+    site = make_site()
+    pool, _ = pool_with(render_host_interval_s=interval)
+    await render_result(pool, prefetched(site, PARALLEL_PINGS))
+    times = site.times("/ping")
+    assert len(times) == 4
+    gaps = [b - a for a, b in pairwise(times)]
+    if min_gap is None:
+        assert max(gaps) < 0.2  # the control: unpaced, they go out together
+    else:
+        assert min(gaps) >= min_gap

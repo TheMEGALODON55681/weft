@@ -3,6 +3,7 @@ same GuardedBackend as plain HTTP, so these tests drive it with raw sockets and 
 backend, no browser."""
 
 import asyncio
+import socket
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -248,3 +249,21 @@ async def test_closing_the_proxy_ends_open_tunnels(site: FixtureSite, proxy_with
     writer.close()
     with pytest.raises(OSError):
         await asyncio.open_connection("127.0.0.1", port)
+
+
+async def test_closing_is_not_held_up_by_idle_connections() -> None:
+    """Chromium preconnects sockets to its proxy and may send nothing on them. Closing must not
+    wait for those, whatever point their handler has reached: not started yet, or waiting for a
+    request head. A render's proxy is closed inside the render's time budget."""
+    for yields in range(6):
+        proxy = GuardedProxy(GuardedBackend(Recording(), True), connect_timeout_s=5)
+        port = await proxy.start()
+        idle = [socket.create_connection(("127.0.0.1", port)) for _ in range(3)]
+        try:
+            for _ in range(yields):
+                await asyncio.sleep(0)
+            async with asyncio.timeout(2):
+                await proxy.aclose()
+        finally:
+            for s in idle:
+                s.close()

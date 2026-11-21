@@ -6,6 +6,7 @@ bad encodings) stays visible in one place.
 """
 
 import gzip
+import random
 import ssl
 import threading
 import time
@@ -184,6 +185,232 @@ def _hold(h: BaseHTTPRequestHandler) -> None:
     _send(h, b"<html><title>held</title></html>")
 
 
+# --- a small site to crawl (Phase 4) -------------------------------------------------------
+#
+# /site/ links to a pricing section (the goal in most tests), unrelated pages, two traps, a
+# near-duplicate pair, an exact duplicate, a canonical alias, a nofollow link, a path robots.txt
+# disallows and an off-site link. Every page is long enough for trafilatura to keep its text.
+
+
+def _page(
+    title: str, body: str, links: list[tuple[str, str]] | None = None, head: str = ""
+) -> bytes:
+    anchors = " ".join(f'<a href="{href}">{text}</a>' for href, text in links or [])
+    return (
+        f"<!doctype html><html lang=en><head><meta charset=utf-8><title>{title}</title>{head}"
+        f"</head><body><nav>{anchors}</nav><article><h1>{title}</h1>{body}</article>"
+        "</body></html>"
+    ).encode()
+
+
+def _para(*sentences: str) -> str:
+    return "".join(f"<p>{s}</p>" for s in sentences)
+
+
+_FILLER = (
+    "The garden club meets on the first Saturday of every month in the community hall. "
+    "Members bring seedlings to swap, and the committee reports on the orchard and the ponds."
+)
+_PRICING = _para(
+    "Our pricing has three plans. The starter plan is free for one person and includes the "
+    "core editor, two projects and community support through the public forum.",
+    "The team plan costs twelve dollars per seat per month, billed monthly or annually, and "
+    "adds shared workspaces, audit logs, single sign-on and priority support.",
+    "Annual billing takes twenty percent off every plan, and seats can be added or removed at "
+    "any time with prorated invoices.",
+)
+_RELEASE = _para(
+    "Release notes for version four. The importer now reads spreadsheets with merged cells, "
+    "the exporter keeps column widths, and the search box remembers the last ten queries.",
+    "Several fixes landed as well: dates in the Samoan time zone no longer shift by a day, the "
+    "sidebar keeps its width after a restart, and printing a long table no longer cuts rows.",
+)
+
+_SHORT_TEXT = (  # 21 words and over 250 characters: kept by trafilatura, under MIN_WORDS
+    "The interoperability documentation describes internationalization, authentication, "
+    "authorization, containerization, orchestration, synchronization, instrumentation, "
+    "observability, virtualization, administration, troubleshooting and accessibility. "
+    "Notwithstanding unprecedented technological advancements."
+)
+
+SITE_PAGES: dict[str, bytes] = {
+    "/site/": _page(
+        "Acme home",
+        _para(
+            "Acme makes a collaborative editor for small teams. This is the home page of the "
+            "test site, with links to every section and to a few things a crawler should avoid."
+        ),
+        [
+            ("/site/about", "About us"),
+            ("/site/blog", "Blog"),
+            ("/site/calendar?month=1", "Events calendar"),
+            ("/trap/1", "Archive"),
+            ("/site/dup-a", "Release notes"),
+            ("/site/dup-b", "Release notes mirror"),
+            ("/site/dup-c", "Release notes copy"),
+            ("/site/alias?utm_source=home", "Plans"),
+            ("/site/pricing", "Pricing"),
+            ("/private/site-secret", "Staff"),
+            ("/site/missing", "Old page"),
+            ("/pdf", "Brochure"),
+            ("http://other.test/elsewhere", "Partner"),
+        ],
+    ),
+    "/site/pricing": _page(
+        "Pricing",
+        _PRICING,
+        [("/site/pricing/enterprise", "Enterprise pricing"), ("/site/", "Home")],
+    ),
+    "/site/pricing/enterprise": _page(
+        "Enterprise pricing",
+        _para(
+            "Enterprise pricing is quoted per contract. Plans include a dedicated support "
+            "engineer, a custom data processing agreement and invoicing in local currency.",
+            "Contact sales for enterprise pricing on more than five hundred seats.",
+        ),
+    ),
+    "/site/alias": _page(
+        "Plans",
+        _PRICING,
+        head='<link rel="canonical" href="/site/pricing">',
+    ),
+    "/site/about": _page("About us", _para(_FILLER, "We are based in a small town by the sea.")),
+    "/site/blog": _page(
+        "Blog",
+        _para(_FILLER) + '<p><a href="/site/nofollowed" rel="nofollow">Sponsored</a></p>',
+        [(f"/site/blog/{i}", f"Garden diary {i}") for i in range(1, 4)],
+    ),
+    **{
+        f"/site/blog/{i}": _page(
+            f"Garden diary {i}",
+            _para(f"Entry {i}. " + _FILLER, f"This week we planted row {i} of the beans."),
+        )
+        for i in range(1, 4)
+    },
+    "/site/nofollowed": _page("Sponsored", _para(_FILLER)),
+    # dup-b differs from dup-a by one date: a near duplicate. dup-c is dup-a with other spacing.
+    "/site/dup-a": _page("Release notes", _RELEASE + _para("Published on 3 March.")),
+    "/site/dup-b": _page("Release notes", _RELEASE + _para("Published on 4 March.")),
+    "/site/dup-c": _page(
+        "Release notes", _RELEASE.replace(". ", ".   ") + _para("Published on 3 March.")
+    ),
+    # Reached only from /site/edge, which nothing else links to. The loop has one segment three
+    # times. The two short pages have the same text, under the word count where simhash applies.
+    "/site/edge": _page(
+        "Edge cases",
+        _para(_FILLER, "This page links to a path that loops and to two short pages."),
+        [
+            ("/site/edge/a/b/a/b/a/b", "Loop"),
+            ("/site/edge/short-a", "Short A"),
+            ("/site/edge/short-b", "Short B"),
+        ],
+    ),
+    **{f"/site/edge/short-{x}": _page("Glossary", _para(_SHORT_TEXT)) for x in ("a", "b")},
+}
+
+
+def _site(h: BaseHTTPRequestHandler) -> None:
+    _send(h, SITE_PAGES[urlsplit(h.path).path])
+
+
+_WORD_LIST = """amber basil cedar dune ember fjord grove heron iris juniper kelp lichen maple nectar
+oak pebble quartz reed sage thistle umber violet willow yarrow zephyr"""
+_WORDS = _WORD_LIST.split()
+
+
+def _unique_text(n: int) -> str:
+    """Sixty words that differ for every n, so trap pages are not near-duplicates of each other
+    and dedupe cannot be what ends the trap."""
+    rng = random.Random(n)  # noqa: S311 - filler text, not a secret
+    return " ".join(rng.choice(_WORDS) for _ in range(60)) + "."
+
+
+def _trap(h: BaseHTTPRequestHandler) -> None:
+    """/trap/<n>: an archive that never ends. Each page links to the next one."""
+    n = int(urlsplit(h.path).path.rsplit("/", 1)[1])
+    _send(
+        h,
+        _page(
+            f"Archive {n}",
+            _para(f"Archive page {n}. " + _unique_text(n)),
+            [(f"/trap/{n + 1}", "Older")],
+        ),
+    )
+
+
+def _calendar(h: BaseHTTPRequestHandler) -> None:
+    """/site/calendar?month=<n>: next and previous month, forever."""
+    n = int(parse_qs(urlsplit(h.path).query).get("month", ["1"])[0])
+    links = [
+        (f"/site/calendar?month={n + 1}", "Next month"),
+        (f"/site/calendar?month={n - 1}", "Previous month"),
+    ]
+    _send(
+        h,
+        _page(
+            f"Events in month {n}",
+            _para(f"Nothing on in month {n}. " + _unique_text(10_000 + n)),
+            links,
+        ),
+    )
+
+
+SITEMAP_INDEX = b"""<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<sitemap><loc>/sitemaps/pages.xml</loc></sitemap>
+<sitemap><loc>/sitemaps/more.xml.gz</loc></sitemap>
+<sitemap><loc>/sitemaps/missing.xml</loc></sitemap>
+</sitemapindex>"""
+
+SITEMAP_PAGES = b"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<url><loc> {base}/site/pricing </loc><lastmod>2026-11-01</lastmod></url>
+<url><loc>{base}/site/about</loc></url>
+<url><loc>{base}/site/search?q=a&amp;page=2</loc></url>
+<url><loc>{base}/private/listed</loc></url>
+<url><loc>http://other.test/not-ours</loc></url>
+</urlset>"""
+
+SITEMAP_MORE = b"""<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<url><loc>{base}/site/blog/1</loc></url></urlset>"""
+
+
+def _sitemap(h: BaseHTTPRequestHandler, body: bytes, gz: bool = False) -> None:
+    host = (h.headers.get("Host") or "").encode()
+    body = body.replace(b"{base}", b"http://" + host).replace(
+        b"<loc>/", b"<loc>http://" + host + b"/"
+    )
+    if gz:
+        _send(h, gzip.compress(body), ctype="application/gzip")
+    else:
+        _send(h, body, ctype="application/xml")
+
+
+def _etag(h: BaseHTTPRequestHandler) -> None:
+    """/etag: the article with an ETag, and a 304 when the client already has it."""
+    if h.headers.get("If-None-Match") == '"v1"':
+        _send(h, status=304, ctype="", headers={"ETag": '"v1"'})
+    else:
+        _send(h, ARTICLE_HTML.encode(), headers={"ETag": '"v1"'})
+
+
+_LAST_MODIFIED = "Tue, 03 Mar 2026 10:00:00 GMT"
+
+
+def _lastmod(h: BaseHTTPRequestHandler) -> None:
+    """/lastmod: as /etag, with Last-Modified and If-Modified-Since."""
+    if h.headers.get("If-Modified-Since") == _LAST_MODIFIED:
+        _send(h, status=304, ctype="")
+    else:
+        _send(h, ARTICLE_HTML.encode(), headers={"Last-Modified": _LAST_MODIFIED})
+
+
+def _blob(h: BaseHTTPRequestHandler) -> None:
+    """/blob/<n>/<name>: n bytes of image, for byte budgets."""
+    n = int(urlsplit(h.path).path.split("/")[2])
+    _send(h, b"\x89PNG" + b"\0" * max(0, n - 4), ctype="image/png")
+
+
 ROUTES: dict[str, Callable[[BaseHTTPRequestHandler], None]] = {
     "/": lambda h: _send(h, b'<html><title>Home</title><a href="/article">a</a></html>'),
     "/article": _article,
@@ -233,12 +460,21 @@ ROUTES: dict[str, Callable[[BaseHTTPRequestHandler], None]] = {
         h, h.rfile.read(int(h.headers.get("Content-Length") or 0)), ctype="text/plain"
     ),
     "/host": lambda h: _send(h, (h.headers.get("Host") or "").encode(), ctype="text/plain"),
+    **{path: _site for path in SITE_PAGES},
+    "/site/calendar": _calendar,
+    "/sitemap.xml": lambda h: _sitemap(h, SITEMAP_INDEX),
+    "/sitemaps/pages.xml": lambda h: _sitemap(h, SITEMAP_PAGES),
+    "/sitemaps/more.xml.gz": lambda h: _sitemap(h, SITEMAP_MORE, gz=True),
+    "/etag": _etag,
+    "/lastmod": _lastmod,
 }
 PREFIX_ROUTES: dict[str, Callable[[BaseHTTPRequestHandler], None]] = {
     "/endless/": _endless,
     "/flaky/": _flaky,
     "/reset/": _reset,
     "/private/": lambda h: _send(h, b"<html><title>private</title></html>"),
+    "/trap/": _trap,
+    "/blob/": _blob,
 }
 
 

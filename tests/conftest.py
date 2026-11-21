@@ -15,6 +15,19 @@ def site() -> Iterator[FixtureSite]:
         yield s
 
 
+@pytest.fixture(scope="session")
+def chromium() -> None:
+    """Skip the test when headless Chromium cannot start here. Checked once per session, with a
+    real launch: the executable existing is not enough to know it runs."""
+    from playwright.sync_api import Error, sync_playwright
+
+    try:
+        with sync_playwright() as pw:
+            pw.chromium.launch(headless=True).close()
+    except Error as exc:
+        pytest.skip(f"headless Chromium is not available: {str(exc).splitlines()[0]}")
+
+
 @pytest.fixture
 def make_site() -> Iterator[Callable[..., FixtureSite]]:
     """A fresh fixture site per call, for tests that need their own robots.txt or hit counts."""

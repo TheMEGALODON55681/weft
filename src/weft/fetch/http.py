@@ -16,7 +16,7 @@ from weft.config import Settings
 from weft.fetch.errors import FetchError
 from weft.fetch.limits import CircuitBreaker, HostLimiter
 from weft.fetch.retry import backoff_delay, parse_retry_after
-from weft.fetch.robots import ROBOTS_AGENT, RobotsCache
+from weft.fetch.robots import ROBOTS_AGENT, RobotsCache, Rules
 from weft.fetch.ssrf import guarded_transport
 from weft.obs.logging import safe_url
 
@@ -43,6 +43,8 @@ class FetchResult:
     redirects: list[str] = field(default_factory=list)  # every URL requested before final_url
     elapsed_ms: float = 0.0
     location: str | None = None  # the absolute redirect target, when redirects were not followed
+    etag: str | None = None
+    last_modified: str | None = None
 
 
 def parse_http_url(raw: str) -> httpx.URL:
@@ -78,8 +80,14 @@ class Fetcher:
         self._max_retries = settings.max_retries
         self._backoff = settings.retry_backoff_s
         self._robots = RobotsCache(self._fetch_robots)
-        self._limiter = HostLimiter(settings.host_concurrency, settings.global_concurrency)
-        self._breaker = CircuitBreaker(settings.breaker_threshold)
+        self._limiter = HostLimiter(
+            settings.host_concurrency,
+            settings.global_concurrency,
+            max_hosts=settings.max_tracked_hosts,
+        )
+        self._breaker = CircuitBreaker(
+            settings.breaker_threshold, max_hosts=settings.max_tracked_hosts
+        )
         self._client = httpx.AsyncClient(
             transport=guarded_transport(settings.allow_loopback, settings.http2),
             # A proxy resolves names itself, so honouring HTTP_PROXY would route around the
@@ -101,13 +109,27 @@ class Fetcher:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def fetch(self, raw_url: str, *, follow_redirects: bool = True) -> FetchResult:
+    async def fetch(
+        self,
+        raw_url: str,
+        *,
+        follow_redirects: bool = True,
+        headers: dict[str, str] | None = None,
+        timeout_s: float | None = None,
+    ) -> FetchResult:
         """With `follow_redirects` off, a redirect comes back as a result carrying `location`, so
-        a browser can follow it itself and each hop still passes through here."""
+        a browser can follow it itself and each hop still passes through here.
+
+        `headers` are sent on every hop (the page cache uses them for conditional requests).
+        `timeout_s` replaces `total_timeout_s` for this call, including the longest wait for the
+        host's turn that is accepted instead of refused with rate_limited. Crawl jobs use it."""
         start = time.perf_counter()
+        budget = timeout_s or self._total_timeout
         try:
-            async with asyncio.timeout(self._total_timeout):
-                result = await self._fetch(raw_url, start, follow=follow_redirects)
+            async with asyncio.timeout(budget):
+                result = await self._fetch(
+                    raw_url, start, budget, follow=follow_redirects, headers=headers
+                )
         except (FetchError, TimeoutError, httpx.RequestError) as exc:
             err = exc if isinstance(exc, FetchError) else _as_fetch_error(exc)
             log.warning("fetch failed", extra={"url": safe_url(raw_url), "code": err.code})
@@ -127,8 +149,24 @@ class Fetcher:
         return result
 
     async def _fetch_robots(self, url: str) -> tuple[int, bytes]:
-        res = await self._fetch(url, time.perf_counter(), robots=False)
+        res = await self._fetch(url, time.perf_counter(), self._total_timeout, robots=False)
         return res.status, res.body
+
+    async def robots_rules(self, raw_url: str) -> Rules:
+        """The robots.txt rules for the URL's origin, read now if they are not cached. Raises
+        FetchError as a fetch would."""
+        try:
+            async with asyncio.timeout(self._total_timeout):
+                return await self._robots.rules_for(parse_http_url(raw_url))
+        except (TimeoutError, httpx.RequestError) as exc:
+            raise _as_fetch_error(exc) from None
+
+    def cached_robots_rules(self, raw_url: str) -> Rules | None:
+        """The origin's rules if they are already cached; never touches the network."""
+        try:
+            return self._robots.cached(parse_http_url(raw_url))
+        except FetchError:
+            return None
 
     async def _check_robots(self, url: httpx.URL) -> float:
         """Refuse a disallowed URL. Returns the site's Crawl-delay in seconds, 0 if it set none."""
@@ -143,7 +181,14 @@ class Fetcher:
         return rules.crawl_delay or 0.0
 
     async def _fetch(
-        self, raw_url: str, start: float, *, robots: bool = True, follow: bool = True
+        self,
+        raw_url: str,
+        start: float,
+        budget: float,
+        *,
+        robots: bool = True,
+        follow: bool = True,
+        headers: dict[str, str] | None = None,
     ) -> FetchResult:
         url = parse_http_url(raw_url)
         seen: set[str] = set()
@@ -153,7 +198,7 @@ class Fetcher:
             interval = 0.0  # robots.txt reads are not spaced, so they cost the first page nothing
             if robots:
                 interval = max(self._interval, await self._check_robots(url))
-            resp, body, truncated = await self._send(url, interval, start)
+            resp, body, truncated = await self._send(url, interval, start, budget, headers)
             location = resp.headers.get("location")
             target = None
             if resp.status_code in _REDIRECT_STATUSES and location:
@@ -183,10 +228,17 @@ class Fetcher:
                 redirects=chain,
                 elapsed_ms=(time.perf_counter() - start) * 1000,
                 location=target,
+                etag=resp.headers.get("etag"),
+                last_modified=resp.headers.get("last-modified"),
             )
 
     async def _send(
-        self, url: httpx.URL, interval_s: float, start: float
+        self,
+        url: httpx.URL,
+        interval_s: float,
+        start: float,
+        budget: float,
+        headers: dict[str, str] | None,
     ) -> tuple[httpx.Response, bytes, bool]:
         """Request `url`, retrying transport failures and 429/502/503/504 with backoff. Every
         attempt passes the host's breaker and limits, so a retry is as polite as the first try and
@@ -198,9 +250,9 @@ class Fetcher:
         while True:
             self._breaker.peek(host)  # fail fast instead of queuing for a host that is down
             try:
-                async with self._limiter.slot(host, interval_s, self._total_timeout):
+                async with self._limiter.slot(host, interval_s, budget):
                     self._breaker.check(host)  # it may have opened while this request waited
-                    resp, body, truncated = await self._attempt(url)
+                    resp, body, truncated = await self._attempt(url, headers)
             except _TRANSIENT as exc:
                 self._breaker.record(host, ok=False)
                 if attempt >= self._max_retries:
@@ -215,7 +267,7 @@ class Fetcher:
                     backoff_delay(attempt, self._backoff),
                     parse_retry_after(resp.headers.get("retry-after")),
                 )
-                if delay >= self._total_timeout - (time.perf_counter() - start):
+                if delay >= budget - (time.perf_counter() - start):
                     return resp, body, truncated  # the wait alone would outlast this call
                 reason = str(resp.status_code)
             log.info(
@@ -225,8 +277,10 @@ class Fetcher:
             await asyncio.sleep(delay)
             attempt += 1
 
-    async def _attempt(self, url: httpx.URL) -> tuple[httpx.Response, bytes, bool]:
-        async with self._client.stream("GET", url) as resp:
+    async def _attempt(
+        self, url: httpx.URL, headers: dict[str, str] | None
+    ) -> tuple[httpx.Response, bytes, bool]:
+        async with self._client.stream("GET", url, headers=headers) as resp:
             if resp.status_code in _REDIRECT_STATUSES and resp.headers.get("location"):
                 return resp, b"", False  # about to be followed; the body is not needed
             body, truncated = await self._read_capped(resp)

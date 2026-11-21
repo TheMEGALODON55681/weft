@@ -258,6 +258,22 @@ async def test_a_crawl_delay_beyond_the_time_budget_fails_fast(
     assert e.value.code == "rate_limited"
 
 
+async def test_a_longer_budget_waits_out_a_crawl_delay_instead_of_refusing(
+    make_site: Callable[..., FixtureSite], fetch_with: Callable[..., Fetcher]
+) -> None:
+    """Crawl jobs pass their own budget: a Crawl-delay longer than total_timeout_s is waited
+    for, not refused."""
+    site = make_site(robots="User-agent: *\nCrawl-delay: 1.5")
+    fetcher = fetch_with(total_timeout_s=1)
+    await fetcher.fetch(site.url("/ping"))
+    with pytest.raises(FetchError):
+        await fetcher.fetch(site.url("/ping"))  # the default budget refuses the wait
+    r = await fetcher.fetch(site.url("/ping"), timeout_s=5)
+    assert r.status == 200
+    first, second = site.times("/ping")
+    assert second - first >= 1.4
+
+
 async def test_a_failing_host_trips_the_breaker_and_stops_being_contacted(
     make_site: Callable[..., FixtureSite], fetch_with: Callable[..., Fetcher]
 ) -> None:
@@ -342,3 +358,58 @@ async def test_refused_addresses_never_trip_the_breaker(
         with pytest.raises(FetchError) as e:
             await fetcher.fetch(site.url("/ping"))
         assert e.value.code == "blocked_address"
+
+
+# --- bounded host state ----------------------------------------------------------------------
+
+
+def test_limiter_forgets_the_least_recently_used_idle_host() -> None:
+    clock = Clock()
+    limiter = HostLimiter(per_host=1, overall=4, clock=clock, max_hosts=2)
+    limiter.reserve("a", 0, 30)
+    limiter.reserve("b", 0, 30)
+    limiter.reserve("a", 0, 30)  # a is now the most recent
+    limiter.reserve("c", 0, 30)
+    assert len(limiter) == 2
+    clock.now += 0  # same instant: b was idle and least recent, so it went
+    assert limiter.reserve("b", 5.0, 30) == 0  # starts fresh
+
+
+def test_limiter_keeps_a_host_still_owed_spacing() -> None:
+    clock = Clock()
+    limiter = HostLimiter(per_host=1, overall=4, clock=clock, max_hosts=1)
+    limiter.reserve("a", 10.0, 30)  # a's next start is 10 s away
+    limiter.reserve("b", 0, 30)
+    assert len(limiter) == 2  # over the cap rather than forget a's spacing
+    assert limiter.reserve("a", 10.0, 30) == 10.0
+
+
+async def test_limiter_keeps_a_host_with_a_request_in_flight() -> None:
+    limiter = HostLimiter(per_host=1, overall=4, max_hosts=1)
+    async with limiter.slot("a", 0, 30):
+        limiter.reserve("b", 0, 30)
+        limiter.reserve("c", 0, 30)
+        assert "a" in limiter._hosts  # pinned while the slot is held
+    limiter.reserve("d", 0, 30)
+    assert "a" not in limiter._hosts
+
+
+def test_breaker_forgets_old_closed_hosts_but_not_open_ones() -> None:
+    clock = Clock()
+    breaker = CircuitBreaker(threshold=2, cooldown_s=30, clock=clock, max_hosts=2)
+    breaker.record("open", ok=False)
+    breaker.record("open", ok=False)  # open for 30 s
+    breaker.record("x", ok=False)
+    breaker.record("y", ok=False)
+    breaker.record("z", ok=False)
+    assert len(breaker) == 2
+    with pytest.raises(FetchError) as e:
+        breaker.peek("open")
+    assert e.value.code == "circuit_open"
+
+
+def test_a_success_forgets_the_host() -> None:
+    breaker = CircuitBreaker(threshold=2, clock=Clock())
+    breaker.record("a", ok=False)
+    breaker.record("a", ok=True)
+    assert len(breaker) == 0

@@ -2,6 +2,7 @@
 
 The page is always fetched over plain HTTP first, so robots.txt, the address guard and every
 redirect hop are handled once, by the Fetcher. The browser, when it is used, renders that body.
+With a cache, a fresh entry skips all of that, and a stale one is revalidated first.
 """
 
 import asyncio
@@ -17,9 +18,11 @@ from weft.config import Settings
 from weft.extract.content import Extracted, extract_page
 from weft.extract.decode import decode_body
 from weft.fetch.browser import BrowserPool
+from weft.fetch.cache import CacheEntry, PageCache
 from weft.fetch.errors import FetchError
 from weft.fetch.http import Fetcher, FetchResult
-from weft.models import PageResult
+from weft.frontier.canon import canonicalize
+from weft.models import PageMetadata, PageResult
 from weft.obs.logging import safe_url
 
 log = logging.getLogger("weft.fetch")
@@ -63,17 +66,60 @@ async def _off_loop[T](settings: Settings, fn: Callable[[], T]) -> T:
         ) from None
 
 
+def _from_cache(entry: CacheEntry, url: str, start: float) -> PageResult:
+    return entry.result.model_copy(
+        update={
+            "url": url.strip(),
+            "cached": True,
+            "body_bytes": 0,
+            "elapsed_ms": (time.perf_counter() - start) * 1000,
+        }
+    )
+
+
 async def get_page(
     fetcher: Fetcher,
     settings: Settings,
     url: str,
     render: RenderMode = "auto",
     browser: BrowserPool | None = None,
+    cache: PageCache | None = None,
+    timeout_s: float | None = None,
 ) -> PageResult:
     start = time.perf_counter()
-    res = await fetcher.fetch(url)
+    entry = key = None
+    if cache is not None:
+        try:
+            key = canonicalize(url)
+        except ValueError:
+            pass  # the fetch below reports the bad URL
+        else:
+            entry = await cache.get(key, render)
+            if entry is not None and entry.fresh:
+                return _from_cache(entry, url, start)
+    headers = entry.validators() if entry else None
+    res = await fetcher.fetch(url, headers=headers, timeout_s=timeout_s)
+    if res.status == 304 and entry is not None and cache is not None and key is not None:
+        await cache.refresh(key, render)
+        return _from_cache(entry, url, start)
+    page = await _build(res, settings, render, browser, start)
+    if cache is not None and key is not None:
+        await cache.put(key, render, page, res.etag, res.last_modified)
+    return page
+
+
+async def _build(
+    res: FetchResult,
+    settings: Settings,
+    render: RenderMode,
+    browser: BrowserPool | None,
+    start: float,
+) -> PageResult:
     # An absent Content-Type is treated as HTML, as browsers do.
     if res.content_type and res.content_type not in _HTML_TYPES:
+        if res.status >= 400:  # an error page is a result whatever its type; there is no text
+            empty = Extracted(None, "", PageMetadata(), [])
+            return _result(res, empty, res.final_url, res.truncated, "http", start, settings)
         raise FetchError(
             "unsupported_content_type",
             f"{res.content_type} (HTTP {res.status}) is not HTML",
@@ -122,4 +168,5 @@ def _result(
         content_truncated=len(markdown) < len(page.markdown),
         redirects=res.redirects,
         elapsed_ms=(time.perf_counter() - start) * 1000,
+        body_bytes=len(res.body),
     )

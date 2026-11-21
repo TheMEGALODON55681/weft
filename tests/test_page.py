@@ -167,7 +167,7 @@ async def test_auto_leaves_a_full_page_alone_and_starts_no_browser(page_of) -> N
     assert page_of.pools[0][0].launches == 0
 
 
-async def test_auto_renders_a_javascript_shell(page_of) -> None:
+async def test_auto_renders_a_javascript_shell(page_of, chromium) -> None:
     p = await page_of("/js-shell", render="auto")
     assert p.fetch_method == "browser"
     assert "Rendered report" in p.markdown
@@ -181,7 +181,7 @@ async def test_never_returns_the_shell_as_fetched(page_of) -> None:
     assert page_of.pools[0][0].launches == 0
 
 
-async def test_always_renders_even_a_full_page(page_of) -> None:
+async def test_always_renders_even_a_full_page(page_of, chromium) -> None:
     p = await page_of("/article", render="always")
     assert p.fetch_method == "browser"
     assert "## Team plan" in p.markdown

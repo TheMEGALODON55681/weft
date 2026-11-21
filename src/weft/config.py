@@ -68,6 +68,27 @@ class Settings(BaseSettings):
     browser_max_pages: int = Field(default=2, gt=0)
     browser_recycle_after: int = Field(default=50, gt=0)
     browser_js_heap_mb: int = Field(default=256, ge=16)
+    # Sub-resources of one render (scripts, images, XHR) share a byte budget, counted as it
+    # arrives, and new connections to one host are spaced by render_host_interval_s.
+    render_max_bytes: int = Field(default=20_000_000, gt=0)
+    render_host_interval_s: float = Field(default=0.05, ge=0)
+
+    # Page cache. A cached page is served without contacting the site until it is
+    # cache_ttl_s old, then revalidated with If-None-Match / If-Modified-Since. 0 turns it off.
+    cache_ttl_s: float = Field(default=3600.0, ge=0)
+
+    # Crawl jobs. A job stops after crawl_timeout_s of running time, summed across resumes.
+    # Each crawl fetch gets crawl_fetch_timeout_s in place of total_timeout_s, so a long
+    # Crawl-delay is waited out instead of refused. At most crawl_max_jobs run at once; the rest
+    # queue.
+    crawl_timeout_s: float = Field(default=1800.0, gt=0)
+    crawl_fetch_timeout_s: float = Field(default=120.0, gt=0)
+    crawl_concurrency: int = Field(default=4, gt=0)
+    crawl_max_jobs: int = Field(default=2, gt=0)
+
+    # Per-host limiter and breaker state is kept for this many hosts, least recently used first
+    # out. Hosts that are mid-request, still owed spacing or have an open breaker are kept.
+    max_tracked_hosts: int = Field(default=4096, gt=0)
 
     @property
     def db_path(self) -> Path:

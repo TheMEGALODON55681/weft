@@ -359,3 +359,34 @@ async def test_a_broken_robots_file_blocks_fetching_and_is_not_hammered(
         assert e.value.code == "robots_unavailable"
     assert site.hits("/article") == 0
     assert site.hits("/robots.txt") == 1
+
+
+# --- Sitemap lines and the cache-only lookup ---------------------------------------------------
+
+
+def test_sitemap_lines_are_collected_from_anywhere_in_the_file() -> None:
+    rules = parse_robots(
+        "Sitemap: https://h.test/a.xml\n"
+        "User-agent: other\nDisallow: /\nSitemap: https://h.test/b.xml\n"
+        "User-agent: *\nDisallow: /x\nsitemap:https://h.test/a.xml\n"
+    )
+    assert rules.sitemaps == ("https://h.test/a.xml", "https://h.test/b.xml")
+    assert not rules.allows("/x")  # a Sitemap line does not end or start a group
+
+
+def test_sitemap_lines_are_capped() -> None:
+    rules = parse_robots("".join(f"Sitemap: https://h.test/{i}.xml\n" for i in range(500)))
+    assert len(rules.sitemaps) == 50
+
+
+async def test_cached_never_reads_the_file() -> None:
+    clock = Clock()
+    fetch = FakeFetch((200, b"User-agent: *\nDisallow: /no"))
+    robots = cache(fetch, clock)
+    assert robots.cached(H) is None
+    assert fetch.calls == []
+    await robots.rules_for(H)
+    rules = robots.cached(H)
+    assert rules is not None and not rules.allows("/no")
+    clock.now += 3601
+    assert robots.cached(H) is None  # expired rules are not handed out

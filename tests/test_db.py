@@ -94,3 +94,30 @@ async def test_refuses_a_database_from_a_newer_version(tmp_path: Path) -> None:
     raw.close()
     with pytest.raises(RuntimeError, match="newer"):
         await Database.open(path)
+
+
+async def test_a_version_1_file_is_migrated_and_keeps_its_jobs(tmp_path: Path) -> None:
+    from weft.db import _MIGRATIONS
+
+    path = tmp_path / "weft.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(f"BEGIN;{_MIGRATIONS[0]}PRAGMA user_version = 1;COMMIT;")
+    raw.execute(
+        "INSERT INTO jobs(id, kind, status, params, created_at, updated_at) "
+        "VALUES ('old', 'crawl', 'done', '{}', 1, 1)"
+    )
+    raw.commit()
+    raw.close()
+
+    db = await Database.open(path)
+    try:
+        version = await db.run(lambda c: c.execute("PRAGMA user_version").fetchone()[0])
+        job = await db.run(lambda c: c.execute("SELECT id, run_s FROM jobs").fetchone())
+        frontier = await db.run(lambda c: {r[1] for r in c.execute("PRAGMA table_info(frontier)")})
+        pages = await db.run(lambda c: {r[1] for r in c.execute("PRAGMA table_info(pages)")})
+    finally:
+        await db.close()
+    assert version == SCHEMA_VERSION == 2
+    assert job == ("old", 0)
+    assert {"simhash", "duplicate_of", "relevance", "run"} <= frontier
+    assert {"url", "render", "result", "etag"} <= pages

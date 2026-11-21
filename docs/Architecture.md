@@ -1,13 +1,13 @@
 # Architecture
 
-State as of Phase 3. Later phases add modules and tables; each phase updates this file.
+State as of Phase 4. Later phases add modules and tables; each phase updates this file.
 
 ## Layout
 
 ```
 src/weft/
   config.py        typed settings: env, TOML file, defaults
-  models.py        shapes returned to the agent (PageResult, Link, PageMetadata)
+  models.py        shapes returned to the agent: pages, jobs, crawl params, site maps
   db.py            SQLite connection, migrations, the single database thread
   obs/logging.py   JSON-lines logging to stderr, secret redaction, safe_url
   fetch/errors.py  FetchError, the one expected failure type
@@ -18,24 +18,34 @@ src/weft/
   fetch/retry.py   backoff with jitter, Retry-After parsing
   fetch/proxy.py   GuardedProxy: the local HTTP proxy Chromium is forced through
   fetch/browser.py BrowserPool: headless Chromium, navigation routing, reuse and limits
-  fetch/page.py    get_page: fetch, decode, extract, render policy, output caps
+  fetch/page.py    get_page: cache lookup, fetch, decode, extract, render policy, output caps
+  fetch/cache.py   PageCache: finished pages in SQLite, TTL and conditional revalidation
   extract/decode.py   bytes to text for mislabelled or undeclared encodings
   extract/content.py  HTML to Markdown, title, metadata
   extract/links.py    outgoing links
+  frontier/canon.py   URL canonicalisation, site keys, URL patterns for trap detection
+  frontier/dedupe.py  content hash, simhash, Hamming distance
+  frontier/score.py   link scores and page relevance against the goal
+  frontier/store.py   Frontier: one job's URLs in SQLite, best score first
+  frontier/sitemap.py map_site: robots.txt Sitemap lines, sitemap parsing, link inventory
+  rank/bm25.py        BM25 with corpus statistics that grow during a crawl, a small stemmer
+  jobs/crawl.py       Crawl: the workers, dedupe, trap limits, the time budget
+  jobs/manager.py     JobManager: start, cancel, list, stats, resume at startup
   server/app.py    FastMCP server, tool definitions, lifespan
   server/cli.py    `weft` entry point
 tests/             unit tests per module, plus tests/fixture_site.py
 docs/
 ```
 
-Planned directories (`rank/`, `frontier/`, `jobs/`) appear with the phase that needs them.
+`rank/` holds only BM25 so far. Phase 5 adds passage ranking there.
 
 ## Data flow: `fetch_page`
 
-1. The tool receives `url` and `render` from the MCP client. `server/app.py` pulls the shared state (settings, database, fetcher, browser pool) from the server lifespan. The pool starts nothing until a page needs it.
-2. Every mode starts with a plain fetch. The browser never fetches the document itself.
-3. `Fetcher.fetch` validates the URL, then runs everything below under one `asyncio.timeout(total_timeout_s)`. Waits for a host's turn, retries, backoff sleeps, robots.txt reads and redirects all spend from that one budget.
-4. The redirect loop in `Fetcher._fetch` handles each hop the same way:
+1. The tool receives `url` and `render` from the MCP client. `server/app.py` pulls the shared state (settings, database, fetcher, browser pool, page cache, job manager) from the server lifespan. The pool starts nothing until a page needs it.
+2. **Cache.** `get_page` canonicalises the URL and looks up `(url, render)` in the page cache. A fresh entry is returned at once, marked `cached`, with the URL as the caller wrote it. A stale entry's `ETag` and `Last-Modified` become `If-None-Match` and `If-Modified-Since` headers on the fetch. A `304` renews the entry and returns it. Anything else carries on below, and a `200` result is stored at the end.
+3. Every mode starts with a plain fetch. The browser never fetches the document itself.
+4. `Fetcher.fetch` validates the URL, then runs everything below under one `asyncio.timeout(total_timeout_s)`. Waits for a host's turn, retries, backoff sleeps, robots.txt reads and redirects all spend from that one budget. A caller can pass `timeout_s` to replace it for one call. Crawl jobs do, with `crawl_fetch_timeout_s`, so a long `Crawl-delay` is waited out instead of refused. Extra `headers` are sent on every hop, which is how the cache's validators travel.
+5. The redirect loop in `Fetcher._fetch` handles each hop the same way:
    1. **robots.txt.** `RobotsCache.rules_for` returns the origin's cached rules, or reads `/robots.txt` on a miss. That read goes through steps b to e itself, with the robots check off and no spacing, so it gets the address guard, the breaker, the host's slots and retries. The hop is refused with `robots_disallowed` if the rules say so. The rules' `Crawl-delay` raises the spacing for this hop. The `/robots.txt` URL itself is never checked.
    2. **Breaker, first look.** `CircuitBreaker.peek` refuses at once if the host's breaker is open, so a caller does not queue for a host that is down.
    3. **Limits.** `HostLimiter.slot` takes one of the host's concurrency slots, reserves the next start time (refusing with `rate_limited` if the wait would exceed `total_timeout_s`), sleeps until then, and takes a global slot. A host that is being made to wait never holds global slots.
@@ -43,17 +53,47 @@ Planned directories (`rank/`, `frontier/`, `jobs/`) appear with the phase that n
    5. **Request.** `_attempt` streams the response. A redirect's body is not read. Any other body is read through a byte cap that counts decompressed bytes. When the client opens a connection, `GuardedBackend` resolves the name, checks every address and connects to a checked one (see Security posture).
    6. **Outcome.** A transport failure, or a `429`, `502`, `503` or `504`, is recorded as a failure against the host. If retries remain, the loop sleeps for the backoff (or the `Retry-After`, if it fits in the remaining budget) outside the slot and goes back to step b. When retries run out, a transport failure is raised and an overloaded response is returned as a result. Any other response is recorded as a success.
    7. **Redirect.** A 3xx with a `Location` is validated (http or https, a host, no credentials, not a URL already visited, within `max_redirects`) and the loop starts again at step a for the new URL.
-5. `get_page` refuses non-HTML content types. An absent `Content-Type` counts as HTML.
-6. Decoding and extraction run in a worker thread so the event loop stays free, under `extract_timeout_s`. The thread comes from a pool of four that belongs to extraction alone. A thread cannot be interrupted, so a timeout frees the caller with `extraction_timeout` and leaves the thread to finish. The separate pool keeps stuck pages from using up the default executor, which also runs DNS lookups. `decode_body` tries a byte-order mark, the header charset, a `<meta>` charset, UTF-8, statistical detection and, as a last resort, UTF-8 with replacement characters. It never raises.
-7. `extract_page` runs trafilatura for Markdown and metadata, and selectolax for links, `<title>`, `lang` and the canonical URL. A parser crash is logged and yields empty Markdown, not an exception.
-8. **Render policy.** With `render="never"`, or `"auto"` when `wants_render` says no, the HTTP extraction is the answer. `wants_render` runs in the same worker thread. It says yes only if the page has a `<script>` and either the extracted text is under `render_min_words` words or a `<noscript>` mentions JavaScript. A page without scripts cannot gain content from a browser. With `render="always"`, the HTTP extraction is skipped.
-9. **Rendering.** `BrowserPool.render` loads the fetched body in Chromium (see Rendering) and returns the serialised DOM and the page's final URL. That HTML goes through `extract_page` in the same pool and under the same timeout. In `"auto"` mode, any render failure is logged as `render skipped` and the HTTP extraction is returned. In `"always"` mode it is raised.
-10. `get_page` applies `max_content_chars` and `max_links`, records the totals, and returns a `PageResult`. `fetch_method` says which path produced the content. `elapsed_ms` covers the whole call.
-11. `server/app.py` converts any `FetchError` into an MCP tool error whose message starts with the error code. Anything else is logged with a traceback and reaches the client as a generic failure, with details masked.
+6. `get_page` refuses non-HTML content types with `unsupported_content_type`, unless the status is 400 or above: an error page is returned as a result with empty Markdown, whatever its type. An absent `Content-Type` counts as HTML.
+7. Decoding and extraction run in a worker thread so the event loop stays free, under `extract_timeout_s`. The thread comes from a pool of four that belongs to extraction alone. A thread cannot be interrupted, so a timeout frees the caller with `extraction_timeout` and leaves the thread to finish. The separate pool keeps stuck pages from using up the default executor, which also runs DNS lookups. `decode_body` tries a byte-order mark, the header charset, a `<meta>` charset, UTF-8, statistical detection and, as a last resort, UTF-8 with replacement characters. It never raises.
+8. `extract_page` runs trafilatura for Markdown and metadata, and selectolax for links, `<title>`, `lang` and the canonical URL. A parser crash is logged and yields empty Markdown, not an exception.
+9. **Render policy.** With `render="never"`, or `"auto"` when `wants_render` says no, the HTTP extraction is the answer. `wants_render` runs in the same worker thread. It says yes only if the page has a `<script>` and either the extracted text is under `render_min_words` words or a `<noscript>` mentions JavaScript. A page without scripts cannot gain content from a browser. With `render="always"`, the HTTP extraction is skipped.
+10. **Rendering.** `BrowserPool.render` loads the fetched body in Chromium (see Rendering) and returns the serialised DOM and the page's final URL. That HTML goes through `extract_page` in the same pool and under the same timeout. In `"auto"` mode, any render failure is logged as `render skipped` and the HTTP extraction is returned. In `"always"` mode it is raised.
+11. `get_page` applies `max_content_chars` and `max_links`, records the totals, and returns a `PageResult`. `fetch_method` says which path produced the content. `elapsed_ms` covers the whole call.
+12. `server/app.py` converts any `FetchError` into an MCP tool error whose message starts with the error code. Anything else is logged with a traceback and reaches the client as a generic failure, with details masked.
+
+## Data flow: `crawl_site`
+
+1. The tool validates and canonicalises the seeds, writes a `jobs` row with status `queued` and the arguments as JSON, and starts a task. It then waits up to `wait_s`, polling the job once a second and sending an MCP progress notification each time, and returns the job with its top 20 pages. The job does not depend on the call: it keeps running if the call returns or the client goes away.
+2. The task waits for one of `crawl_max_jobs` slots, then sets the job `running`, unless it was cancelled meanwhile.
+3. `Crawl.run` puts any `fetching` rows back to `pending`, rebuilds its duplicate fingerprints from the `done` rows, and inserts the seeds at depth 0 (a resumed job already has them, and the insert leaves existing rows alone). The time budget is `crawl_timeout_s` minus the `run_s` that earlier runs recorded.
+4. `crawl_concurrency` workers run in a `TaskGroup`, so a crash in one stops the others. Each worker, under one shared condition:
+   1. stops if `max_pages` URLs have been taken,
+   2. takes the pending row with the best score (ties go to the row discovered first) and marks it `fetching`,
+   3. or, if nothing is pending, stops when no other worker is busy, and otherwise waits for one to finish, since it may add links.
+5. **Fetch.** `get_page` with the job's render mode, the shared browser pool and the page cache, and a timeout of `crawl_fetch_timeout_s` or the time left, whichever is smaller. A `FetchError` marks the row `failed` with its code.
+6. **Aliases.** If the final URL after redirects canonicalises to something else, that URL is recorded as a `duplicate` of this one, so it is never fetched.
+7. **Judge.** In order:
+   - A status of 400 or more: `failed`, with error `http_<status>`.
+   - A `<link rel="canonical">` that names another in-scope URL: `duplicate` of that URL, which is queued if it is new. If the target is itself already a duplicate (two pages naming each other), the link is ignored and this page is kept.
+   - The SHA-256 of the Markdown's words matches a kept page: `duplicate`.
+   - With at least 30 words, a simhash within 6 bits of a kept page: `duplicate`.
+   - Otherwise `done`. Its relevance is BM25 of title plus Markdown against the goal, `s / (s + 2)`. The page joins the corpus statistics first.
+8. **Expand.** A `done` page under `max_depth` adds its links. Each is canonicalised and dropped if it is `nofollow`, out of scope (another site with `same_domain_only`, failing the include or exclude globs, longer than 2048 characters, repeating a path segment more than twice), more than ten in a row with its parent's URL pattern, or disallowed by robots.txt rules that are already cached. Its score is `0.45 * anchor overlap + 0.25 * URL overlap + 0.30 * parent relevance`, where overlap is the share of goal terms present. With no goal, the score is `1 / (1 + depth)`, which makes the crawl breadth-first. Links already known keep their row. A pending one takes the higher score, the smaller depth and the shorter pattern run.
+9. After each page the job's `run_s` and `updated_at` are written.
+10. The crawl ends when the workers stop (`exhausted` or `max_pages`) or the budget runs out (`time_budget`). Rows still `fetching` go back to `pending`, and the task marks the job `done` with the reason, but only if it is still `running`, so a cancel is never overwritten.
+
+`cancel_job` marks the job `cancelled`, cancels the task, waits for it and puts its `fetching` rows back. Shutdown cancels every task and leaves the rows alone: jobs stay `running`, which is also what a kill leaves, and `JobManager.resume` restarts every `queued` or `running` job at the next startup. Statistics in `get_job` are computed from the frontier rows when asked, so nothing about them can go stale across a restart.
+
+## Data flow: `map_site`
+
+1. `get_page` fetches the start page with `render="never"`. Its failure is the tool's failure.
+2. The start origin's robots.txt is read through the Fetcher. Its `Sitemap:` lines are the queue, resolved against the site root if relative. With none, the queue is `/sitemap.xml`.
+3. Up to 20 files are fetched through the Fetcher. A body starting with the gzip magic bytes is unpacked to at most `max_body_bytes`. `<loc>` and `<lastmod>` are read by pattern, never by an XML parser, so there are no entities to expand. A `<sitemapindex>` adds its children to the queue.
+4. URLs are canonicalised, kept only on the start page's site, and deduplicated. The start page and its links go in first. A URL seen first as a link takes the sitemap's `lastmod`. `allowed` comes from that URL's own origin's robots rules if they are cached, and is `null` otherwise. Reading stops at `max_urls`.
 
 ## Error model
 
-`FetchError(code, message)` is the one expected failure type. Codes are stable strings listed in the README. HTTP error statuses are not errors: a 404 page, or a 503 that outlasted the retries, comes back as a normal result with its status.
+`FetchError(code, message)` is the one expected failure type. Codes are stable strings listed in the README. HTTP error statuses are not errors: a 404 page, or a 503 that outlasted the retries, comes back as a normal result with its status, whatever its content type. A crawl records them as failures with the code `http_<status>`.
 
 Which layer raises each code, and what the retry loop and breaker do with it:
 
@@ -70,6 +110,7 @@ Which layer raises each code, and what the retry loop and breaker do with it:
 | `unsupported_content_type`, `extraction_timeout` | `fetch/page.py` | no | no |
 | `render_unavailable` | `fetch/browser.py` (Chromium missing or will not start, pool closed), `fetch/page.py` (no pool) | no | no |
 | `render_failed`, `timeout` from rendering | `fetch/browser.py` | no | no |
+| `unknown_job` | `server/app.py` | no | no |
 
 The last two rows reach the caller only with `render="always"`. In `"auto"` mode they fall back to the HTTP result. A navigation that the Fetcher refuses inside a render does not fail the render: the browser sees a blocked request and the page carries on without it.
 
@@ -86,17 +127,20 @@ Errors from the robots.txt read itself (a timeout, a dead host, a blocked addres
 **One render.** Under `asyncio.timeout(render_timeout_s)`:
 
 1. Take one of `browser_max_pages` slots, then a browser.
-2. Open a new context with service workers blocked, downloads off and Weft's User-Agent. Contexts are never reused, so cookies and storage die with the call.
-3. Route every request in the context through one handler:
-   - **Not a navigation.** Continue it. Chromium sends it to the proxy.
+2. Start a `GuardedProxy` for this render alone, on a fresh loopback port, with a byte budget of `render_max_bytes` and connection spacing of `render_host_interval_s`.
+3. Open a new context with that proxy (and `<-loopback>` again), service workers blocked, downloads off and Weft's User-Agent. Contexts are never reused, so cookies and storage die with the call.
+4. Route every request in the context through one handler:
+   - **Not a navigation.** Continue it. Chromium sends it to the render's proxy.
    - **The first navigation.** Fulfil it with the body, status and content type the Fetcher already has. There is no second fetch.
    - **Any other navigation** (frames, script navigations, popups). Non-GET is aborted. A GET goes to `Fetcher.fetch(url, follow_redirects=False)`, so the hop gets robots.txt, the breaker, the host's slot and spacing, retries and the address guard, as a plain fetch does. A refusal aborts the request. A redirect comes back with its `location`. Chromium follows a fulfilled 3xx without asking the route again, so the next hop would skip the Fetcher. The handler answers with a 200 page holding a `<meta http-equiv="refresh">` to the target instead, and the next hop arrives as a new navigation.
-4. Go to the document's final URL and wait for `load`, then up to three seconds for the network to go quiet.
-5. Serialise the DOM, cap it at `max_body_bytes`, note `page.url`, and close the context.
+5. Go to the document's final URL and wait for `load`, then up to three seconds for the network to go quiet.
+6. Serialise the DOM, cap it at `max_body_bytes`, note `page.url`, close the context, then close the render's proxy, which ends any tunnel still open. A spent byte budget is reported as truncation.
 
 A Playwright error (a crashed tab, a heap that ran out) becomes `render_failed`. Running out of time becomes `timeout`. Either way the context is closed and the browser stays usable.
 
-**The proxy.** `GuardedProxy` speaks the part of HTTP/1.1 that Chromium uses with a proxy. `CONNECT host:port` (HTTPS and WebSockets) opens an upstream through `GuardedBackend.connect_tcp`, the same code that guards plain HTTP, answers 200 and copies bytes both ways. An absolute-form request (plain `http://`) is rewritten to origin form, with `Host` taken from the URL, hop-by-hop headers dropped and `Connection: close` added, and only the request's own `Content-Length` body is forwarded. A request with `Transfer-Encoding` gets 411, because the proxy cannot tell where it would end. Anything else the client sends on that connection is read and dropped, so a second request can never reuse an upstream checked for another host. A blocked address answers 403 with the same message as plain HTTP, which does not say where the name points. A name that does not resolve answers 502, and a connect timeout 504. Heads over 64 KiB and malformed requests get 400. A tunnel ends when either side closes or goes quiet for `read_timeout_s`. Closing the proxy ends every open tunnel.
+**The proxies.** The pool keeps one browser-wide `GuardedProxy`, started with the first browser, because Chromium on Windows needs a browser-wide proxy before per-context proxies work. Every context overrides it, so it only sees traffic that belongs to no context. Each render's own proxy is the same class with two extras. Its byte budget counts bytes relayed from upstream. Once spent, every relay stops at its next chunk and new connections get a 403. Its pacing reserves a start time per host name, with the limiter's `reserve`, before each upstream connect. A wait longer than `read_timeout_s` is refused with a 503. Plain HTTP through the proxy is one request per connection, so for `http://` pacing is per request. An HTTPS tunnel can carry many requests, so for `https://` it is per connection. Closing a proxy never waits on idle clients. It sets a flag that any handler not yet started checks first, cancels the rest, and bounds Python 3.12's `Server.wait_closed()` at one second, because a socket Chromium opened ahead of need would otherwise hold it until the render timed out.
+
+`GuardedProxy` speaks the part of HTTP/1.1 that Chromium uses with a proxy. `CONNECT host:port` (HTTPS and WebSockets) opens an upstream through `GuardedBackend.connect_tcp`, the same code that guards plain HTTP, answers 200 and copies bytes both ways. An absolute-form request (plain `http://`) is rewritten to origin form, with `Host` taken from the URL, hop-by-hop headers dropped and `Connection: close` added, and only the request's own `Content-Length` body is forwarded. A request with `Transfer-Encoding` gets 411, because the proxy cannot tell where it would end. Anything else the client sends on that connection is read and dropped, so a second request can never reuse an upstream checked for another host. A blocked address answers 403 with the same message as plain HTTP, which does not say where the name points. A name that does not resolve answers 502, and a connect timeout 504. Heads over 64 KiB and malformed requests get 400. A tunnel ends when either side closes or goes quiet for `read_timeout_s`. Closing the proxy ends every open tunnel.
 
 ## Storage
 
@@ -106,21 +150,25 @@ All access goes through a single dedicated thread (`Database.run(fn)`). The conn
 
 Migrations are an append-only list in `db.py`. Entry N takes the file from `user_version` N-1 to N, and the schema and the version bump commit together. A file with a newer `user_version` than the build knows is refused at startup.
 
-Schema version 1 (created at startup, no code reads or writes these tables yet):
+Schema version 2. Version 1 created the three tables in Phase 1 with nothing using them. Migration 2 adds `stop_reason` and `run_s` to `jobs`, and drops and rebuilds `frontier` and `pages`, which had never held a row.
 
 | Table | Purpose | Key columns |
 | --- | --- | --- |
-| `jobs` | Crawl and search jobs | `id`, `kind`, `status`, `params` (JSON), `error`, timestamps |
-| `frontier` | URLs per job, ordered by score | primary key `(job_id, url)`, `depth`, `score`, `state`, `attempts`; cascades on job delete |
-| `pages` | Page cache | primary key `url`, `final_url`, `status`, `etag`, `last_modified`, `content_hash`, `markdown`, `expires_at` |
+| `jobs` | Crawl jobs | `id` (random hex), `kind`, `status` (`queued`, `running`, `done`, `failed`, `cancelled`), `params` (JSON of `CrawlParams`), `stop_reason`, `error`, `run_s`, timestamps |
+| `frontier` | One row per URL a job knows | primary key `(job_id, url)` with the canonical URL; `depth`, `score`, `parent_url`, `anchor_text`, `run`; `state` (`pending`, `fetching`, `done`, `duplicate`, `failed`); after the fetch `final_url`, `status`, `title`, `snippet`, `relevance`, `content_hash`, `simhash` (signed 64-bit), `duplicate_of`, `error`, `bytes`, `elapsed_ms`, `cached`, `fetched_at`. Index `(job_id, state, score DESC, discovered_at)` serves `claim`. Rows cascade on job delete. |
+| `pages` | Page cache | primary key `(url, render)`; `result` (a `PageResult` as JSON), `etag`, `last_modified`, `fetched_at`, `expires_at` |
 
-Phase 4 will migrate these as the crawler needs. Expect a version 2. Nothing from Phase 2 or 3 is stored: the robots cache, limiter state, breaker state and browser pool live in memory and start empty.
+Every frontier change commits on its own, which is what makes a kill safe: the worst case is a row left `fetching`, and the next run puts it back. An alias row (a redirect target or a canonical name) has `state = 'duplicate'` and no `fetched_at`, so it does not count against `max_pages`.
+
+The robots cache, limiter state, breaker state, browser pool, BM25 statistics and the duplicate fingerprints of a running crawl live in memory. The fingerprints are rebuilt from the `done` rows when a job resumes. The BM25 statistics start again.
 
 ## Configuration
 
 `Settings` (pydantic-settings). Precedence: init arguments, `WEFT_*` environment variables, TOML file, defaults. The TOML path is `WEFT_CONFIG`, falling back to `./weft.toml`. The CLI's `--config` sets `WEFT_CONFIG`. Unknown keys are rejected. The CLI prints validation problems by field name and never echoes the offending value.
 
-Phase 2 added `allow_loopback`, `host_min_interval_s`, `host_concurrency`, `global_concurrency`, `max_retries`, `retry_backoff_s`, `breaker_threshold` and `extract_timeout_s`. Phase 3 added `render_min_words`, `render_timeout_s`, `browser_max_pages`, `browser_recycle_after` and `browser_js_heap_mb`. The three-second settle wait after `load` and the five-second limit on closing a context are constants.
+Phase 2 added `allow_loopback`, `host_min_interval_s`, `host_concurrency`, `global_concurrency`, `max_retries`, `retry_backoff_s`, `breaker_threshold` and `extract_timeout_s`. Phase 3 added `render_min_words`, `render_timeout_s`, `browser_max_pages`, `browser_recycle_after` and `browser_js_heap_mb`. Phase 4 added `render_max_bytes`, `render_host_interval_s`, `cache_ttl_s`, `crawl_timeout_s`, `crawl_fetch_timeout_s`, `crawl_concurrency`, `crawl_max_jobs` and `max_tracked_hosts`.
+
+Crawl constants that are not settings: ten links in a row per URL pattern, 2048 characters per URL, a path segment at most twice, a 6-bit simhash threshold over at least 30 words, 280 characters of snippet, 20 sitemap files per `map_site`, 50 `Sitemap:` lines per robots.txt, and the score weights in `frontier/score.py`. The three-second settle wait after `load` and the five-second limit on closing a context are constants.
 
 Three values stay constants: the breaker's 30 second cooldown, the robots.txt cache time of an hour, and the minute that an unreadable robots.txt is remembered. Nobody had a reason to tune them, and a setting is easier to add than to take back.
 
@@ -132,6 +180,8 @@ Secrets are redacted by field name (token, secret, password, authorization, cook
 
 Phase 2 adds two lines to the `weft.fetch` logger: a warning, `refused non-public address`, with the host and the addresses it resolved to (the caller is not told them), and an info line, `retrying`, with the attempt number and the reason. The existing `fetch failed` warning now also carries the new error codes.
 
+Phase 4 adds, on `weft.jobs`, `job queued`, `job resumed`, `job done` (with the stop reason) and `job failed` (an error with the traceback), and on `weft.crawl` an info line `crawled` per page, with the job, URL and state. `ready` now carries `jobs_resumed`. The browser adds `render byte budget spent` (info, with the bytes).
+
 Phase 3 adds `browser started` (info, with the launch count), `browser unavailable` and `render failed` (warnings, with the first line of the Playwright error), and `render skipped` (info, when `"auto"` falls back to HTTP, with the code). A navigation the Fetcher refuses inside a render is logged as an ordinary `fetch failed`.
 
 ## Security posture
@@ -142,6 +192,7 @@ In place:
 - **Loopback.** Refused, unless `allow_loopback` is set. That setting opens `127.0.0.0/8` and `::1` and nothing else. The remote transport in Phase 6 must not enable it.
 - **What the caller learns.** A refusal says that a name resolves to a non-public address. It does not say which one, so a probe cannot map internal DNS.
 - **Proxies.** The HTTP client ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`. A proxy resolves names for itself and would sit outside the check. `SSL_CERT_FILE` still applies.
+- **Crawls.** A crawl adds no new way to reach the network. Every page, alias target, canonical target and sitemap file is fetched by the same Fetcher, with the same address check, robots.txt, pacing and breaker. Seeds and links are canonicalised first, and URLs with credentials are dropped. Glob patterns are limited to 500 characters each and 50 per list, and `fnmatch` compiles them without catastrophic backtracking. Sitemaps are read by pattern, not by an XML parser, so entity expansion cannot happen, and gzip is unpacked to `max_body_bytes` at most.
 - **The browser.** Chromium never opens a connection of its own. The document comes from the Fetcher. Every other navigation is fetched by the Fetcher one hop at a time. All other traffic goes through `GuardedProxy`, which uses the same `GuardedBackend` as plain HTTP. `<-loopback>` removes Chromium's built-in rule that sends localhost traffic around a proxy. Weft passes it explicitly, so an environment variable that turns off Playwright's own default cannot undo it. Chromium's own resolver answers "not found" for every name except the proxy's address, so anything that tried to go around the proxy could not even look up a host. WebRTC may not send UDP that the proxy cannot carry. Chromium refuses WebTransport behind a proxy by itself, and a test keeps it that way. Service workers are blocked. A test also calls `register` through the prototype, which gets past a stub on the navigator object, and checks that the script is never fetched. Contexts are discarded after each render.
 - **Politeness.** robots.txt on every hop, per-host spacing and concurrency, a global cap, retries with backoff, and a breaker per host. Weft has no setting to ignore robots.txt.
 - **Existing controls.** URLs limited to http and https, no credentials in URLs, caps on time, size and redirect hops, no cookie persistence, error details masked from the client, secrets redacted from logs, and a server instruction telling the agent that page content is untrusted.
@@ -152,22 +203,25 @@ How the guard reaches the client: httpx has no public hook for how connections a
 
 Known ceilings:
 
-- Limits are per host name. `example.com`, `example.com.` and a second name for the same server are separate hosts. Per-host state in the limiter and breaker is never evicted. The robots cache holds 512 origins and drops the least recently used.
+- Limits are per host name. `example.com`, `example.com.` and a second name for the same server are separate hosts. The limiter and the breaker keep state for `max_tracked_hosts` hosts and drop the least recently used idle one. A host that is mid-request, owed spacing or has an open breaker is kept even past the cap. The robots cache holds 512 origins and drops the least recently used.
 - robots.txt paths are compared as sent, without percent-encoding normalisation. Matching is plain string search, not regular expressions, because the file is controlled by the site.
 - A hostname that resolves to several addresses is tried one address at a time, in resolver order, with no happy-eyeballs race.
 - On Windows a numeric spelling such as `2130706433` fails to resolve at all, after about three seconds, so the error is `network_error` there and `blocked_address` on Linux and macOS. Nothing connects either way.
 - HTTP/2 through the guarded transport has no test. The fixture can serve HTTPS, but it speaks HTTP/1.1 over it.
 - A page that hangs extraction occupies one of four threads until it finishes. Four of them stop extraction.
-- Pacing and the breaker apply to the browser's navigations, not to its sub-resources. A page that loads a hundred images from a host sends a hundred requests through the proxy, unpaced. Each one is still address-checked.
-- The proxy listens on a loopback port without authentication. Another local process could use it, but only to reach addresses the guard allows.
-- `browser_js_heap_mb` caps JavaScript memory per tab, not DOM, image or GPU memory. There is no per-render byte cap on sub-resources. `render_timeout_s` bounds how long a render can keep pulling them.
+- robots.txt, host pacing and the breaker apply to the browser's navigations, not to its sub-resources. Sub-resources get the address check, `render_max_bytes` and `render_host_interval_s` spacing per host. Over HTTPS the spacing is per tunnel, and one tunnel can carry many requests.
+- The proxies listen on loopback ports without authentication. A per-render proxy lives only for its render, and the browser-wide one lives as long as the browser. Another local process could use either, but only to reach addresses the guard allows.
+- `browser_js_heap_mb` caps JavaScript memory per tab, not DOM, image or GPU memory. The byte budget caps what a render downloads, not what it allocates.
 - The fulfilled document carries only its status and content type, not the origin's other headers, so the page runs without its own Content-Security-Policy. Nothing in a throwaway context is worth protecting, but the rendered DOM can differ from what a real visitor sees.
 - `status` in a rendered result is the document's status, even if a script then navigated to another page.
 - A gzip bomb is cut at the byte cap, but the check runs per decoded chunk, so memory can spike to about 1000 times one network chunk before the cut.
+- The page cache is shared by every caller. That is safe only while Weft sends no cookies. Authenticated crawls must bypass or partition it.
+- Jobs are not limited in number, only in how many run at once. Every queued job is a waiting task and a row. Phase 6 should cap queued jobs per caller before the server goes on a network.
+- Nothing is ever deleted: jobs, frontier rows and cache rows, expired ones included.
 
 ## Tests
 
-`tests/fixture_site.py` runs a local HTTP server on a random port. It serves a sample article, redirect chains and loops, an endless redirect, oversized and gzip-bomb bodies, a slow response, a response that drips bytes, Latin-1 and meta-declared Windows-1251 pages, non-HTML types, error statuses and a cookie echo. Phase 2 added a `robots.txt` whose body (or status, or absence) each test can choose, a route that fails a set number of times before succeeding, a route that drops the connection, a route that records how many requests were in flight at once, redirects to metadata, private and IPv4-mapped addresses, and per-site counters for hits and request times, so a test can prove that a request did or did not reach the server. Later phases add a JavaScript-rendered page, a near-duplicate pair and an infinite link trap.
+`tests/fixture_site.py` runs a local HTTP server on a random port. It serves a sample article, redirect chains and loops, an endless redirect, oversized and gzip-bomb bodies, a slow response, a response that drips bytes, Latin-1 and meta-declared Windows-1251 pages, non-HTML types, error statuses and a cookie echo. Phase 2 added a `robots.txt` whose body (or status, or absence) each test can choose, a route that fails a set number of times before succeeding, a route that drops the connection, a route that records how many requests were in flight at once, redirects to metadata, private and IPv4-mapped addresses, and per-site counters for hits and request times, so a test can prove that a request did or did not reach the server. Phase 4 adds a small site under `/site/` (see below).
 
 `tests/conftest.py` sets `WEFT_ALLOW_LOOPBACK=1`, `WEFT_HOST_MIN_INTERVAL_S=0` and a 10 millisecond retry backoff for every test, because the fixture site is on 127.0.0.1. Tests of the address guard, the limiter and the retry timing pass their own values. Init arguments beat the environment.
 
@@ -179,6 +233,12 @@ Phase 3 adds a JavaScript shell page, `/goto` (a redirect to a target the test n
 
 `tests/test_proxy.py` drives `GuardedProxy` with raw sockets and a recording backend, with no browser: CONNECT and plain forwarding, refusals before any connect, rebinding between connections, one request per connection, request bodies, Host rewriting, malformed and oversized heads, and tunnels closing with the proxy.
 
-`tests/test_browser.py` runs a real headless Chromium. The SSRF cases put the proxy behind a fake resolver (`cdn.test` public, `internal.test` private) and a backend that connects every address to the fixture site. If anything got past the guard, the fixture would count the request, so a zero count proves the guard refused it. The main case serves an allowed page that tries images, a stylesheet, `fetch`, WebSockets, a beacon, a worker, a redirect from an allowed host to a blocked one, and a frame, against private, loopback, `localhost` and `[::1]` targets. Positive controls (a script, a fetch, a WebSocket and a redirect on the allowed host) must reach the fixture by the same mechanisms. Other cases cover UDP (WebRTC and WebTransport, checked on a UDP socket), service workers, robots.txt, spacing and the breaker on navigations, the page cap, recycling, a heap blowout, a tab spinning forever, the render timeout, a missing browser and a closed pool. These tests skip if `chromium-headless-shell` is not installed. The rendering tests in `tests/test_page.py` do not skip: they fail without it.
+`tests/test_browser.py` runs a real headless Chromium. The SSRF cases put the proxy behind a fake resolver (`cdn.test` public, `internal.test` private) and a backend that connects every address to the fixture site. If anything got past the guard, the fixture would count the request, so a zero count proves the guard refused it. The main case serves an allowed page that tries images, a stylesheet, `fetch`, WebSockets, a beacon, a worker, a redirect from an allowed host to a blocked one, and a frame, against private, loopback, `localhost` and `[::1]` targets. Positive controls (a script, a fetch, a WebSocket and a redirect on the allowed host) must reach the fixture by the same mechanisms. Other cases cover UDP (WebRTC and WebTransport, checked on a UDP socket), service workers, robots.txt, spacing and the breaker on navigations, the page cap, recycling, a heap blowout, a tab spinning forever, the render timeout, a missing browser and a closed pool. These tests skip if `chromium-headless-shell` is not installed. The rendering tests in `tests/test_page.py` skip too, through a session fixture that launches Chromium once to find out.
 
-`tests/test_server.py` includes a real stdio round trip: it spawns `python -m weft` and talks to it over pipes.
+`tests/test_server.py` includes a real stdio round trip: it spawns `python -m weft` and talks to it over pipes. Phase 4 adds the crawl tools over an in-memory MCP client, progress notifications, a fetch served from the cache a crawl filled, `map_site`, and a server that is stopped mid-crawl and resumes the job when it starts again.
+
+Phase 4 fixture site. `/site/` links to a pricing section, unrelated pages, a blog with a `nofollow` link, two traps (`/trap/N`, an archive that never ends, and `/site/calendar?month=N`, which links a month either way), a near-duplicate pair (`/site/dup-a` and `/site/dup-b`, one date apart), an exact duplicate with other spacing (`/site/dup-c`), a canonical alias (`/site/alias`, reached through a `utm_source` link), a path robots.txt disallows, a 404, a PDF and an off-site link. Trap pages carry text that differs for every N, so dedupe cannot be what ends the trap. There is also a sitemap index with a plain sitemap, a gzip sitemap and a missing one, routes that answer `304` to `If-None-Match` and `If-Modified-Since`, and `/blob/N/...`, which serves N bytes of image.
+
+`tests/test_crawl.py` drives `JobManager` against that site: goal order against breadth-first order, both traps bounded with the depth and page budgets out of the way, duplicates and aliases kept once, scope rules, failure codes and metrics, the time budget, the job slot limit, cancellation, a worker crash, shutdown and resume, and a real kill. The kill test starts a crawl in a child Python process, kills it with no warning once three pages are in, then resumes the job in the test and checks that it finishes with at most two pages fetched twice.
+
+`tests/test_cache.py` covers fresh hits, `ETag` and `Last-Modified` revalidation, refetching without validators, error pages, render modes and a zero TTL. `tests/test_canon.py`, `tests/test_dedupe_score.py` and `tests/test_sitemap.py` are mostly pure units. `tests/test_browser.py` gains the render byte budget, with a sequence of downloads that must stop at the third, and connection spacing, with an unpaced control.
