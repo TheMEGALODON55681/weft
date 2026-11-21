@@ -94,6 +94,24 @@ async def test_the_goal_is_crawled_first(make_site, env) -> None:
     assert site.hits_under("/trap/") == {}
 
 
+async def test_anchor_text_alone_decides_which_link_is_fetched_first(make_site, env) -> None:
+    """Four links with the same URL shape, the matching one listed last, from a page that says
+    nothing about the goal. Only anchor text can put it first. Dropping the anchor weight, or
+    the crawler failing to hand the anchor text to the scorer, leaves a four-way tie that goes
+    to the first link listed, and this test fails."""
+    site: FixtureSite = make_site()
+    e = await env(crawl_concurrency=1)
+    r = await e.crawl(seed_urls=[site.url("/site/anchors")], goal="refund policy", max_pages=2)
+    order = [path(site, u) for u in await e.fetch_order(r.job.id)]
+    assert order == ["/site/anchors", "/site/anchors/a4"]
+    assert site.hits_under("/site/anchors/a") == {"/site/anchors/a4": 1}
+    scores = {path(site, u): row["score"] for u, row in (await e.rows(r.job.id)).items()}
+    assert scores["/site/anchors/a4"] > 0
+    assert (
+        scores["/site/anchors/a1"] == scores["/site/anchors/a2"] == scores["/site/anchors/a3"] == 0
+    )
+
+
 async def test_without_a_goal_the_crawl_is_breadth_first(make_site, env) -> None:
     site: FixtureSite = make_site()
     e = await env(crawl_concurrency=1)

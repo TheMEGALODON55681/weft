@@ -88,3 +88,58 @@ def test_zero_is_allowed_where_it_means_off(field: str) -> None:
     Settings(**{field: 0})
     with pytest.raises(ValidationError):
         Settings(**{field: -1})
+
+
+# --- the optional model providers -----------------------------------------------------------
+
+
+def test_the_model_features_are_off_and_unconfigured_by_default() -> None:
+    s = Settings()
+    assert s.embedding_rerank is False and s.llm_extraction is False
+    assert s.embedding_base_url == s.llm_base_url == ""
+    assert s.embedding_api_key is None and s.llm_api_key is None
+
+
+@pytest.mark.parametrize(
+    ("flag", "prefix"), [("embedding_rerank", "embedding"), ("llm_extraction", "llm")]
+)
+def test_a_feature_cannot_be_turned_on_without_an_endpoint_and_a_model(
+    flag: str, prefix: str
+) -> None:
+    with pytest.raises(ValidationError, match=f"{prefix}_base_url and {prefix}_model") as e:
+        Settings(**{flag: True})
+    assert flag in str(e.value)  # the error names the flag
+    with pytest.raises(ValidationError, match=f"{prefix}_base_url and {prefix}_model"):
+        Settings(**{flag: True, f"{prefix}_base_url": "https://models.test/v1"})
+    with pytest.raises(ValidationError, match=f"{prefix}_base_url and {prefix}_model"):
+        Settings(**{flag: True, f"{prefix}_model": "m"})
+    ok = Settings(
+        **{flag: True, f"{prefix}_base_url": "https://models.test/v1", f"{prefix}_model": "m"}
+    )
+    assert getattr(ok, flag) is True
+
+
+@pytest.mark.parametrize("field", ["embedding_base_url", "llm_base_url"])
+def test_an_endpoint_must_be_http_or_https(field: str) -> None:
+    Settings(**{field: "http://localhost:8080/v1"})
+    Settings(**{field: "HTTPS://models.test/v1"})  # a scheme is not case sensitive
+    for bad in ("ftp://models.test", "models.test/v1", "file:///etc/passwd"):
+        with pytest.raises(ValidationError, match="http"):
+            Settings(**{field: bad})
+
+
+def test_an_api_key_never_shows_in_the_settings_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WEFT_LLM_API_KEY", "key-from-the-environment")
+    s = Settings(embedding_api_key="key-given-directly")
+    assert s.llm_api_key is not None and s.embedding_api_key is not None
+    assert s.llm_api_key.get_secret_value() == "key-from-the-environment"
+    assert s.embedding_api_key.get_secret_value() == "key-given-directly"
+    shown = repr(s) + str(s) + s.model_dump_json()
+    assert "key-from-the-environment" not in shown and "key-given-directly" not in shown
+
+
+@pytest.mark.parametrize("field", ["llm_max_input_chars", "provider_timeout_s"])
+def test_provider_limits_must_be_positive(field: str) -> None:
+    Settings(**{field: 1})
+    with pytest.raises(ValidationError):
+        Settings(**{field: 0})

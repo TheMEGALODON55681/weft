@@ -52,8 +52,25 @@ def test_stemming_meets_the_obvious_forms() -> None:
     assert stem("is") == "is"  # too short to strip
 
 
+def test_single_letters_are_not_terms() -> None:
+    assert terms("q plan x") == ["plan"]
+
+
 def test_goal_words_that_describe_the_task_are_dropped() -> None:
     assert terms("Find every pricing page") == [stem("pricing")]
+
+
+def test_words_outside_ascii_stay_whole() -> None:
+    """An ASCII-only tokenizer splits 'für' into single letters and drops them, so a page in
+    German, French or Russian would have no searchable terms."""
+    assert terms("Größe für Küche") == [stem("größe"), "für", stem("küche")]
+    assert terms("Цена подписки") == ["цена", stem("подписки")]
+    # Lowering the dotted capital I gives 'i' plus a combining mark. The word must not split there.
+    assert terms("İstanbul") == ["i̇stanbul"]
+    goal = Bm25("küche")
+    doc = terms("Die Küche ist groß")
+    goal.add(doc)
+    assert goal.score(doc) > 0
 
 
 def test_bm25_prefers_the_page_about_the_goal() -> None:

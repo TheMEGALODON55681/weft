@@ -7,8 +7,11 @@ Early in a crawl the corpus is a handful of pages, so IDF is rough; it settles a
 import math
 import re
 from collections import Counter
+from collections.abc import Collection, Iterator
 
-_WORD = re.compile(r"[a-z0-9]+")
+# Letters and digits in any script, so 'für' and 'цена' stay whole. Scripts written without
+# spaces (Chinese, Japanese, Thai) come out as one long token per run: they need a segmenter.
+_WORD = re.compile(r"[^\W_]+")
 # Words that say what the caller wants done, not what to look for.
 _STOP_WORDS = """a all an and any are as at be by each every find for from get how i in is it list
 me of on or page pages show the to what where which with"""
@@ -24,8 +27,25 @@ def stem(word: str) -> str:
     return word
 
 
+def _tokens(text: str) -> Iterator[tuple[int, str]]:
+    """(offset, stemmed term) for each searchable word. The one tokenizer, so that offsets and
+    scores always agree on what a word is."""
+    for m in _WORD.finditer(text):
+        # Lowered after the match. Lowering the text first can turn one letter (the Turkish
+        # dotted capital I) into a letter plus a combining mark, which the pattern would then
+        # split on.
+        word = m.group().lower()
+        if word not in _STOP and len(word) > 1:
+            yield m.start(), stem(word)
+
+
 def terms(text: str) -> list[str]:
-    return [stem(w) for w in _WORD.findall(text.lower()) if w not in _STOP and len(w) > 1]
+    return [t for _, t in _tokens(text)]
+
+
+def term_offsets(text: str, wanted: Collection[str]) -> list[int]:
+    """Where in `text` the words that become one of the `wanted` terms start."""
+    return [i for i, t in _tokens(text) if t in wanted]
 
 
 class Bm25:

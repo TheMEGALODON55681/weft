@@ -325,6 +325,48 @@ def _unique_text(n: int) -> str:
     return " ".join(rng.choice(_WORDS) for _ in range(60)) + "."
 
 
+# Reached only from /site/anchors. Its four links share a URL shape and lead to pages with no
+# words in common with the goal "refund policy", and the page that lists them says nothing
+# about it either. The matching link is listed last, so a crawl that ignored anchor text would
+# tie all four and take the first one listed.
+SITE_PAGES["/site/anchors"] = _page(
+    "Departments",
+    _para(_FILLER, "Pick a department below."),
+    [
+        ("/site/anchors/a1", "Contact"),
+        ("/site/anchors/a2", "Careers"),
+        ("/site/anchors/a3", "Partners"),
+        ("/site/anchors/a4", "Refund policy"),
+    ],
+)
+for _i in range(1, 5):
+    SITE_PAGES[f"/site/anchors/a{_i}"] = _page(
+        f"Department {_i}", _para(f"Department {_i}. " + _unique_text(2000 + _i))
+    )
+
+
+# A job board for extraction. The list holds records (.role) and the detail pages each have a
+# title (the h1) and a salary (.salary). The list has no .salary, so a schema that requires one
+# matches the detail pages and not the list. Each detail page has its own text.
+_ROLES = [("Data Analyst", 80500, "/site/jobs/1"), ("Designer", 95000, "/site/jobs/2")]
+SITE_PAGES["/site/jobs"] = _page(
+    "Careers",
+    _para("Open roles at Acme, a small company that makes a collaborative editor for teams.")
+    + "".join(
+        f'<div class="role"><h2>{title}</h2><span class="pay">${pay:,}</span>'
+        f'<a href="{href}">Details</a></div>'
+        for title, pay, href in _ROLES
+    ),
+    [(href, title) for title, _pay, href in _ROLES],
+)
+for _n, (_title, _pay, _href) in enumerate(_ROLES):
+    SITE_PAGES[_href] = _page(
+        _title,
+        _para(f"Join the {_title.lower()} team. " + _unique_text(3000 + _n))
+        + f'<p>Salary: <span class="salary">${_pay:,}</span> a year.</p>',
+    )
+
+
 def _trap(h: BaseHTTPRequestHandler) -> None:
     """/trap/<n>: an archive that never ends. Each page links to the next one."""
     n = int(urlsplit(h.path).path.rsplit("/", 1)[1])

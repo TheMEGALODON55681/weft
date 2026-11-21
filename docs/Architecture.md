@@ -1,13 +1,15 @@
 # Architecture
 
-State as of Phase 4. Later phases add modules and tables; each phase updates this file.
+State as of Phase 5. Later phases add modules and tables; each phase updates this file.
 
 ## Layout
 
 ```
 src/weft/
   config.py        typed settings: env, TOML file, defaults
-  models.py        shapes returned to the agent: pages, jobs, crawl params, site maps
+  models.py        shapes returned to the agent: pages, jobs, crawl params, site maps, search hits, extraction items
+  providers.py     optional model providers: the two Protocols, one HTTP client for each, ProviderError
+  retrieval.py     what search_in_site and extract do with a job's pages: read back, rank, rerank, extract
   db.py            SQLite connection, migrations, the single database thread
   obs/logging.py   JSON-lines logging to stderr, secret redaction, safe_url
   fetch/errors.py  FetchError, the one expected failure type
@@ -18,17 +20,21 @@ src/weft/
   fetch/retry.py   backoff with jitter, Retry-After parsing
   fetch/proxy.py   GuardedProxy: the local HTTP proxy Chromium is forced through
   fetch/browser.py BrowserPool: headless Chromium, navigation routing, reuse and limits
-  fetch/page.py    get_page: cache lookup, fetch, decode, extract, render policy, output caps
-  fetch/cache.py   PageCache: finished pages in SQLite, TTL and conditional revalidation
+  fetch/page.py    get_document and get_page: cache lookup, fetch, decode, extract, render policy, output caps
+  fetch/cache.py   PageCache: finished pages and their HTML in SQLite, TTL and conditional revalidation
   extract/decode.py   bytes to text for mislabelled or undeclared encodings
   extract/content.py  HTML to Markdown, title, metadata
   extract/links.py    outgoing links
+  extract/schema.py   Extractor: CSS and XPath rules written into a JSON Schema, validation, limits
+  extract/llm.py      the model fallback: prompt, call, parse
   frontier/canon.py   URL canonicalisation, site keys, URL patterns for trap detection
   frontier/dedupe.py  content hash, simhash, Hamming distance
   frontier/score.py   link scores and page relevance against the goal
   frontier/store.py   Frontier: one job's URLs in SQLite, best score first
   frontier/sitemap.py map_site: robots.txt Sitemap lines, sitemap parsing, link inventory
-  rank/bm25.py        BM25 with corpus statistics that grow during a crawl, a small stemmer
+  rank/bm25.py        BM25 with corpus statistics that grow during a crawl, the tokenizer, a small stemmer
+  rank/passages.py    passage splitting, passage ranking over many pages, snippets
+  rank/rerank.py      reciprocal rank fusion of keyword rank and embedding rank
   jobs/crawl.py       Crawl: the workers, dedupe, trap limits, the time budget
   jobs/manager.py     JobManager: start, cancel, list, stats, resume at startup
   server/app.py    FastMCP server, tool definitions, lifespan
@@ -37,12 +43,12 @@ tests/             unit tests per module, plus tests/fixture_site.py
 docs/
 ```
 
-`rank/` holds only BM25 so far. Phase 5 adds passage ranking there.
+`rank/` holds everything that scores text: the BM25 the crawl uses for pages is the BM25 that search uses for passages.
 
 ## Data flow: `fetch_page`
 
-1. The tool receives `url` and `render` from the MCP client. `server/app.py` pulls the shared state (settings, database, fetcher, browser pool, page cache, job manager) from the server lifespan. The pool starts nothing until a page needs it.
-2. **Cache.** `get_page` canonicalises the URL and looks up `(url, render)` in the page cache. A fresh entry is returned at once, marked `cached`, with the URL as the caller wrote it. A stale entry's `ETag` and `Last-Modified` become `If-None-Match` and `If-Modified-Since` headers on the fetch. A `304` renews the entry and returns it. Anything else carries on below, and a `200` result is stored at the end.
+1. The tool receives `url` and `render` from the MCP client. `server/app.py` pulls the shared state from the server lifespan: a `CrawlDeps` (settings, database, fetcher, browser pool, page cache), the job manager and the optional providers. The pool starts nothing until a page needs it.
+2. **Cache.** `get_page` is `get_document` without the HTML. It canonicalises the URL and looks up `(url, render)` in the page cache. A fresh entry is returned at once, marked `cached`, with the URL as the caller wrote it. A stale entry's `ETag` and `Last-Modified` become `If-None-Match` and `If-Modified-Since` headers on the fetch. A `304` renews the entry and returns it. Anything else carries on below, and a `200` result is stored at the end.
 3. Every mode starts with a plain fetch. The browser never fetches the document itself.
 4. `Fetcher.fetch` validates the URL, then runs everything below under one `asyncio.timeout(total_timeout_s)`. Waits for a host's turn, retries, backoff sleeps, robots.txt reads and redirects all spend from that one budget. A caller can pass `timeout_s` to replace it for one call. Crawl jobs do, with `crawl_fetch_timeout_s`, so a long `Crawl-delay` is waited out instead of refused. Extra `headers` are sent on every hop, which is how the cache's validators travel.
 5. The redirect loop in `Fetcher._fetch` handles each hop the same way:
@@ -91,6 +97,24 @@ docs/
 3. Up to 20 files are fetched through the Fetcher. A body starting with the gzip magic bytes is unpacked to at most `max_body_bytes`. `<loc>` and `<lastmod>` are read by pattern, never by an XML parser, so there are no entities to expand. A `<sitemapindex>` adds its children to the queue.
 4. URLs are canonicalised, kept only on the start page's site, and deduplicated. The start page and its links go in first. A URL seen first as a link takes the sitemap's `lastmod`. `allowed` comes from that URL's own origin's robots rules if they are cached, and is `null` otherwise. Reading stops at `max_urls`.
 
+## Data flow: `search_in_site`
+
+1. The tool checks the URL like a crawl seed, then checks that the query has a searchable word (`terms(query)` is not empty), so both failures come before a job exists. `limit` is capped at `RERANK_CANDIDATES` (50), so every hit it can return is one that was reranked.
+2. It starts a crawl job with the URL as the only seed, the query as the goal and `max_pages` as the budget, and waits up to `wait_s` exactly as `crawl_site` does, with the same progress notifications. The wait and the job read are the shared `_crawl` helper in `server/app.py`. A job that is still running when the wait ends is left running, and its pages so far are searched.
+3. `retrieval.search` reads each kept page back with `get_document` and the job's own render mode, so the read is a cache hit and costs no request. A page that raises `FetchError` is counted in `pages_unreadable` and left out.
+4. `rank_passages` runs in the extraction pool under `extract_timeout_s`. For each page, `split_passages` cuts the Markdown at ATX headings (found by string tests, since a regex over a long untrusted line can backtrack). Lines with no letter or digit are dropped. A heading sets the label of the passages below it. Short lines are gathered until a passage has 150 characters, and a line over 700 is cut at sentence ends, then at words, then into slices. All passages of all pages form one BM25 corpus. A passage's terms are its page title, its heading and its text, so the title and heading count. A passage whose text already appeared on an earlier page is dropped. Passages with a score above zero are hits, in stable order for ties.
+5. If an embedding provider is configured and there are hits, the best 50 go to `rerank`. It embeds the query and each hit's title, heading and text in one call, checks that the answer has one vector per input and one dimension, and sorts by `1/(60 + keyword rank) + 1/(60 + similarity rank)`. A tie keeps the keyword order. A `ProviderError` is logged as `rerank skipped` and the keyword order stands, with `reranked: false`.
+6. Each hit gets a snippet: the 240-character window with the most query words, started 40 characters before the first one and cut at word boundaries, with an ellipsis where text was left out. Scores are rounded to six places. `complete` is true when the job's status is `done`.
+
+## Data flow: `extract`
+
+1. The schema is compiled into an `Extractor` before anything is fetched. `_check_structure` walks it iteratively and refuses a `$ref` that leaves the schema and nesting past 64 levels. Then the size check (50,000 characters as compact JSON), the JSON Schema meta-schema check, and one pass that compiles each selector (CSS through `cssselect`'s HTML translator, XPath through lxml) and enforces 300 nodes (the schema, its properties and its array items), 8 levels and 500 characters per selector. Any failure is an `InvalidSchema` that the tool turns into `invalid_schema`.
+2. A value that starts with `http://` or `https://` is a URL. Anything else is a job id, and an unknown id is `unknown_job`.
+3. For a URL, `get_document(..., "auto", with_html=True)` fetches the page as `fetch_page` would. For a job, the job's pages come from the job manager, most relevant first, and each is read with the job's render mode. HTML is read only here: `search` does not ask for it, so it never decompresses it.
+4. For each page, in the extraction pool under `extract_timeout_s`: `Extractor.run` parses the HTML once with lxml, then evaluates the rules from the root. Values are collected under a budget of `max_content_chars` characters, and a run that passes it raises `DataTooLarge`, which becomes an error on the item instead of data. `Extractor.errors` then validates the result against the schema.
+5. A schema with no selectors skips the rules and gets an error that says what is missing. If there are errors, a model provider is configured and fewer than 10 model calls have been made in this tool call, the model is asked: the schema without its selectors, the URL and up to `llm_max_input_chars` of Markdown, with a system message that calls the text untrusted data. The reply is parsed (a code fence is tolerated) and validated, in the pool, against the same schema. A valid reply makes the item `method: "llm"`. A provider error, a reply that is not JSON or a reply that does not validate leaves the item as the rules left it with one more error: `llm: <code>` or `llm: its answer did not satisfy the schema`.
+6. A URL returns its one item whatever it holds. A job returns only the items that are valid and not empty (`None`, `{}` and `[]` are empty), and stops reading once `limit` pages have matched. A page that cannot be read, or whose extraction times out, is counted in `pages_unreadable`.
+
 ## Error model
 
 `FetchError(code, message)` is the one expected failure type. Codes are stable strings listed in the README. HTTP error statuses are not errors: a 404 page, or a 503 that outlasted the retries, comes back as a normal result with its status, whatever its content type. A crawl records them as failures with the code `http_<status>`.
@@ -110,9 +134,11 @@ Which layer raises each code, and what the retry loop and breaker do with it:
 | `unsupported_content_type`, `extraction_timeout` | `fetch/page.py` | no | no |
 | `render_unavailable` | `fetch/browser.py` (Chromium missing or will not start, pool closed), `fetch/page.py` (no pool) | no | no |
 | `render_failed`, `timeout` from rendering | `fetch/browser.py` | no | no |
-| `unknown_job` | `server/app.py` | no | no |
+| `unknown_job`, `invalid_query`, `invalid_schema` | `server/app.py` | no | no |
 
-The last two rows reach the caller only with `render="always"`. In `"auto"` mode they fall back to the HTTP result. A navigation that the Fetcher refuses inside a render does not fail the render: the browser sees a blocked request and the page carries on without it.
+A `ProviderError` (`provider_unreachable`, `provider_error`, `provider_bad_response`) is not a tool error. `search_in_site` and `extract` catch it and carry on without the model, and the agent sees `reranked: false` or an `llm:` line in an item's errors.
+
+The two render rows reach the caller only with `render="always"`. In `"auto"` mode they fall back to the HTTP result. A navigation that the Fetcher refuses inside a render does not fail the render: the browser sees a blocked request and the page carries on without it.
 
 Only transport failures are retried, because only they can pass by themselves. A refusal that depends on the request, such as a blocked address or a disallowed path, would give the same answer again. A temporary DNS failure (`EAI_AGAIN`) is the one resolver error treated as a transport failure.
 
@@ -150,13 +176,13 @@ All access goes through a single dedicated thread (`Database.run(fn)`). The conn
 
 Migrations are an append-only list in `db.py`. Entry N takes the file from `user_version` N-1 to N, and the schema and the version bump commit together. A file with a newer `user_version` than the build knows is refused at startup.
 
-Schema version 2. Version 1 created the three tables in Phase 1 with nothing using them. Migration 2 adds `stop_reason` and `run_s` to `jobs`, and drops and rebuilds `frontier` and `pages`, which had never held a row.
+Schema version 3. Version 1 created the three tables in Phase 1 with nothing using them. Migration 2 adds `stop_reason` and `run_s` to `jobs`, and drops and rebuilds `frontier` and `pages`, which had never held a row. Migration 3 drops and rebuilds `pages` with an `html` column, so every page cached before it is lost and fetched again. Jobs and frontier rows are kept.
 
 | Table | Purpose | Key columns |
 | --- | --- | --- |
 | `jobs` | Crawl jobs | `id` (random hex), `kind`, `status` (`queued`, `running`, `done`, `failed`, `cancelled`), `params` (JSON of `CrawlParams`), `stop_reason`, `error`, `run_s`, timestamps |
 | `frontier` | One row per URL a job knows | primary key `(job_id, url)` with the canonical URL; `depth`, `score`, `parent_url`, `anchor_text`, `run`; `state` (`pending`, `fetching`, `done`, `duplicate`, `failed`); after the fetch `final_url`, `status`, `title`, `snippet`, `relevance`, `content_hash`, `simhash` (signed 64-bit), `duplicate_of`, `error`, `bytes`, `elapsed_ms`, `cached`, `fetched_at`. Index `(job_id, state, score DESC, discovered_at)` serves `claim`. Rows cascade on job delete. |
-| `pages` | Page cache | primary key `(url, render)`; `result` (a `PageResult` as JSON), `etag`, `last_modified`, `fetched_at`, `expires_at` |
+| `pages` | Page cache | primary key `(url, render)`; `result` (a `PageResult` as JSON), `html` (zlib-compressed: the rendered DOM for a browser page, else the decoded body), `etag`, `last_modified`, `fetched_at`, `expires_at` |
 
 Every frontier change commits on its own, which is what makes a kill safe: the worst case is a row left `fetching`, and the next run puts it back. An alias row (a redirect target or a canonical name) has `state = 'duplicate'` and no `fetched_at`, so it does not count against `max_pages`.
 
@@ -167,6 +193,10 @@ The robots cache, limiter state, breaker state, browser pool, BM25 statistics an
 `Settings` (pydantic-settings). Precedence: init arguments, `WEFT_*` environment variables, TOML file, defaults. The TOML path is `WEFT_CONFIG`, falling back to `./weft.toml`. The CLI's `--config` sets `WEFT_CONFIG`. Unknown keys are rejected. The CLI prints validation problems by field name and never echoes the offending value.
 
 Phase 2 added `allow_loopback`, `host_min_interval_s`, `host_concurrency`, `global_concurrency`, `max_retries`, `retry_backoff_s`, `breaker_threshold` and `extract_timeout_s`. Phase 3 added `render_min_words`, `render_timeout_s`, `browser_max_pages`, `browser_recycle_after` and `browser_js_heap_mb`. Phase 4 added `render_max_bytes`, `render_host_interval_s`, `cache_ttl_s`, `crawl_timeout_s`, `crawl_fetch_timeout_s`, `crawl_concurrency`, `crawl_max_jobs` and `max_tracked_hosts`.
+
+Phase 5 added `embedding_rerank`, `embedding_base_url`, `embedding_model`, `embedding_api_key`, `llm_extraction`, `llm_base_url`, `llm_model`, `llm_api_key`, `llm_max_input_chars` and `provider_timeout_s`. The keys are `SecretStr`, so they never print. An endpoint must start with `http://` or `https://`, and a flag cannot be on without its endpoint and model. Both are checked when settings load, so a bad combination stops the server at startup. The check for the pair relies on the flag being declared after its endpoint fields, which a comment in `config.py` says.
+
+Retrieval constants that are not settings: passages of 150 to 700 characters, 240 characters per snippet, 50 rerank candidates, a reciprocal rank constant of 60, at most 10 model calls per `extract` call, a 50,000 character schema, 300 nodes, 8 levels and 500 characters per selector, and 10 validation errors of 300 characters each.
 
 Crawl constants that are not settings: ten links in a row per URL pattern, 2048 characters per URL, a path segment at most twice, a 6-bit simhash threshold over at least 30 words, 280 characters of snippet, 20 sitemap files per `map_site`, 50 `Sitemap:` lines per robots.txt, and the score weights in `frontier/score.py`. The three-second settle wait after `load` and the five-second limit on closing a context are constants.
 
@@ -182,6 +212,8 @@ Phase 2 adds two lines to the `weft.fetch` logger: a warning, `refused non-publi
 
 Phase 4 adds, on `weft.jobs`, `job queued`, `job resumed`, `job done` (with the stop reason) and `job failed` (an error with the traceback), and on `weft.crawl` an info line `crawled` per page, with the job, URL and state. `ready` now carries `jobs_resumed`. The browser adds `render byte budget spent` (info, with the bytes).
 
+Phase 5 adds `page unreadable` (info, with the URL and code), `rerank skipped` and `model extraction failed` (warnings, with the provider error code and nothing else). `ready` now says whether each optional feature is on.
+
 Phase 3 adds `browser started` (info, with the launch count), `browser unavailable` and `render failed` (warnings, with the first line of the Playwright error), and `render skipped` (info, when `"auto"` falls back to HTTP, with the code). A navigation the Fetcher refuses inside a render is logged as an ordinary `fetch failed`.
 
 ## Security posture
@@ -196,6 +228,9 @@ In place:
 - **The browser.** Chromium never opens a connection of its own. The document comes from the Fetcher. Every other navigation is fetched by the Fetcher one hop at a time. All other traffic goes through `GuardedProxy`, which uses the same `GuardedBackend` as plain HTTP. `<-loopback>` removes Chromium's built-in rule that sends localhost traffic around a proxy. Weft passes it explicitly, so an environment variable that turns off Playwright's own default cannot undo it. Chromium's own resolver answers "not found" for every name except the proxy's address, so anything that tried to go around the proxy could not even look up a host. WebRTC may not send UDP that the proxy cannot carry. Chromium refuses WebTransport behind a proxy by itself, and a test keeps it that way. Service workers are blocked. A test also calls `register` through the prototype, which gets past a stub on the navigator object, and checks that the script is never fetched. Contexts are discarded after each render.
 - **Politeness.** robots.txt on every hop, per-host spacing and concurrency, a global cap, retries with backoff, and a breaker per host. Weft has no setting to ignore robots.txt.
 - **Existing controls.** URLs limited to http and https, no credentials in URLs, caps on time, size and redirect hops, no cookie persistence, error details masked from the client, secrets redacted from logs, and a server instruction telling the agent that page content is untrusted.
+- **Search and extraction.** They add no way to reach the network. Every page comes from the page cache or from the same Fetcher, so the address check, robots.txt and pacing apply. Reading pages back asks the Fetcher only for entries that expired or are missing.
+- **Extraction rules.** The schema is the agent's input and the page is a stranger's, so both are bounded. The schema is limited in size, properties, depth, selector length and JSON nesting, and checked before any fetch. A `$ref` may point only inside the schema, which `jsonschema` would not fetch anyway but nothing should rely on that. Selectors run on an lxml tree from the HTML parser, which loads no external entities and no network resource. XPath 1.0 has no function that opens a file or a URL. A run collects at most `max_content_chars` characters, because a selector such as `div` on nested divs returns the same text at every level, and a page can build that for a few kilobytes. Validation errors are capped at ten of 300 characters.
+- **Providers.** The endpoints come from settings and no tool argument can name one. The key is a `SecretStr`, sent only in the `Authorization` header. Redirects are not followed, since one would carry the key to wherever it points. A call has a wall-clock limit, because the HTTP client's timeouts apply per read and a server that drips bytes would never trip them. An error carries a code and a short message that never holds the key or the response body. The model is told that the page is data and to ignore instructions in it, and its reply is trusted no further than its validity against the schema.
 
 How the guard reaches the client: httpx has no public hook for how connections are opened, so `guarded_transport` replaces the network backend on the transport's connection pool, through a private attribute. If an httpx upgrade moves it, the guard fails closed, because the SSRF tests expect refusals and would fail. A dependency bump should run them.
 
@@ -217,7 +252,12 @@ Known ceilings:
 - A gzip bomb is cut at the byte cap, but the check runs per decoded chunk, so memory can spike to about 1000 times one network chunk before the cut.
 - The page cache is shared by every caller. That is safe only while Weft sends no cookies. Authenticated crawls must bypass or partition it.
 - Jobs are not limited in number, only in how many run at once. Every queued job is a waiting task and a row. Phase 6 should cap queued jobs per caller before the server goes on a network.
-- Nothing is ever deleted: jobs, frontier rows and cache rows, expired ones included.
+- Nothing is ever deleted: jobs, frontier rows and cache rows, expired ones included. `search_in_site` starts a job per call, and a cache row now holds the page's HTML, so rows are about ten times larger.
+- The provider endpoints are not behind the address guard. An operator who sets one to a server on their own network means to reach it. If endpoints ever come from a caller, they need the guard first.
+- A model cannot be kept from copying misleading page text into a field that accepts any string. The schema bounds the shape of the answer, not its truth. The agent should treat `extract` data as it treats page text.
+- A JSON Schema `pattern` and an XPath come from the agent and run against page text. A pathological one can hold one of the four extraction threads until it finishes, the same ceiling as a page that hangs extraction.
+- A search ranks all its pages in one pass under `extract_timeout_s`. Many very long pages can exceed it.
+- The model calls of one `extract` call run in sequence, so a slow endpoint can hold the call for ten times `provider_timeout_s`.
 
 ## Tests
 
@@ -242,3 +282,11 @@ Phase 4 fixture site. `/site/` links to a pricing section, unrelated pages, a bl
 `tests/test_crawl.py` drives `JobManager` against that site: goal order against breadth-first order, both traps bounded with the depth and page budgets out of the way, duplicates and aliases kept once, scope rules, failure codes and metrics, the time budget, the job slot limit, cancellation, a worker crash, shutdown and resume, and a real kill. The kill test starts a crawl in a child Python process, kills it with no warning once three pages are in, then resumes the job in the test and checks that it finishes with at most two pages fetched twice.
 
 `tests/test_cache.py` covers fresh hits, `ETag` and `Last-Modified` revalidation, refetching without validators, error pages, render modes and a zero TTL. `tests/test_canon.py`, `tests/test_dedupe_score.py` and `tests/test_sitemap.py` are mostly pure units. `tests/test_browser.py` gains the render byte budget, with a sequence of downloads that must stop at the third, and connection spacing, with an unpaced control.
+
+Phase 5 adds no network to the tests. `tests/test_providers.py` drives the HTTP clients through `httpx.MockTransport`, so no socket opens, and checks the request each one builds (URL, body, bearer header only with a key), the three error codes, that no response body or key reaches an error, that a redirect is not followed and that a slow server is given up on. `tests/test_server.py` injects fake providers into `build_server`, with settings that point at a host that cannot resolve, so a call that reached for the network would fail. A fake embedder places passages so that the reranked order is known, and a fake model records every prompt it is sent.
+
+`tests/test_passages.py` covers splitting (headings, gathering, sentence cuts, long unbroken lines, tables and rules), ranking across pages, repeats, ties and snippets, in several scripts. `tests/test_schema_extract.py` is pure: every selector form, numbers, attributes, records, mixed CSS and XPath, every refusal, the output budget, and one `Extractor` shared by sixteen threads. `tests/test_rerank.py` and `tests/test_llm_extract.py` use fake providers.
+
+The fixture site gains `/site/anchors` (four links that differ only in anchor text, the matching one listed last) and `/site/jobs` with two detail pages (records with a title, a pay and a link, and a salary on each detail page). `tests/test_crawl.py` uses the first to show that anchor text alone decides the fetch order. The server tests crawl the second to extract from a URL and from a job, to show that a job's pages are read from the cache with the hit counter unchanged, and to count pages that cannot be read again by making `get_document` fail for one of them.
+
+`tests/test_cache.py`, `tests/test_page.py` and `tests/test_db.py` cover the HTML column: a stored page's HTML round trip, the rendered DOM from a real headless Chromium, a revalidated page keeping its HTML and the migration from version 2.

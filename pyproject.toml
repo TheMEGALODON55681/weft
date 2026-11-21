@@ -16,6 +16,11 @@ dependencies = [
     "selectolax",
     "trafilatura",
     "charset-normalizer",
+    # Schema extraction: lxml runs the XPath rules, cssselect lets it run CSS rules on the same
+    # tree, jsonschema validates the result. lxml arrives with trafilatura either way.
+    "lxml",
+    "cssselect",
+    "jsonschema",
     # Pinned to one minor release: each one drives its own Chromium build, so an upgrade
     # means downloading a new browser. The browser itself is a separate download:
     # `playwright install chromium-headless-shell`.
@@ -62,6 +67,12 @@ select = ["E", "F", "I", "B", "UP", "ASYNC", "S", "SIM", "RUF"]
 python_version = "3.12"
 files = ["src/weft"]
 strict = true
+
+# These two ship no type information, and their stub packages lag the releases. The schema
+# module keeps their results behind typed functions.
+[[tool.mypy.overrides]]
+module = ["jsonschema", "lxml", "lxml.*"]
+ignore_missing_imports = true
 
 [tool.ruff.lint.flake8-bugbear]
 # CurrentContext() is a dependency-injection marker, evaluated once at definition time on purpose.

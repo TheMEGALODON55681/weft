@@ -1,6 +1,6 @@
 """Shapes handed back to the calling agent. Every result carries the URL it came from."""
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -100,6 +100,45 @@ class JobResult(BaseModel):
     job: JobInfo
     pages: list[CrawlPage]  # most relevant first
     pages_total: int  # pages_ok, before limit and offset
+
+
+class SearchHit(BaseModel):
+    url: str  # the page to cite
+    title: str | None
+    heading: str | None  # the nearest heading above the passage
+    snippet: str  # the stretch of the passage that holds the query words
+    passage: str
+    score: float  # comparable only within this result
+
+
+class SearchResult(BaseModel):
+    query: str
+    hits: list[SearchHit]  # best first
+    pages_searched: int  # pages that were read for passages
+    pages_unreadable: int  # crawled pages that could not be read again
+    passages_searched: int
+    reranked: bool  # the order was set by embedding similarity as well as keywords
+    complete: bool  # the crawl finished; if not, more pages may still turn up
+    job: JobInfo
+
+
+class ExtractItem(BaseModel):
+    url: str  # the page the data came from; cite it
+    data: Any  # what was found; may not satisfy the schema when valid is false
+    valid: bool  # data satisfies the schema
+    errors: list[str]  # why it does not, empty when valid
+    method: Literal["rules", "llm"]
+
+
+class ExtractResult(BaseModel):
+    source: Literal["url", "job"]
+    job_id: str | None
+    job_status: JobStatus | None
+    items: list[ExtractItem]
+    pages_total: int  # pages the source offered: 1 for a URL, the job's pages otherwise
+    pages_checked: int
+    pages_matched: int  # valid and not empty
+    pages_unreadable: int
 
 
 class SiteMapEntry(BaseModel):

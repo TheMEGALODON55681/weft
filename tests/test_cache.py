@@ -10,7 +10,7 @@ from weft.config import Settings
 from weft.db import Database
 from weft.fetch.cache import PageCache
 from weft.fetch.http import Fetcher
-from weft.fetch.page import get_page
+from weft.fetch.page import get_document, get_page
 
 
 class Clock:
@@ -115,3 +115,76 @@ async def test_a_zero_ttl_turns_the_cache_off(make_site, setup) -> None:
     for _ in range(2):
         await get_page(fetcher, Settings(), site.url("/article"), cache=cache)
     assert site.hits("/article") == 2
+
+
+# --- the HTML a page's text came from, for extraction rules ----------------------------------
+
+
+async def test_the_html_is_stored_with_the_page_and_read_on_request(make_site, setup) -> None:
+    site: FixtureSite = make_site()
+    fetcher, cache, _ = setup()
+    live = await get_document(
+        fetcher, Settings(), site.url("/article"), cache=cache, with_html=True
+    )
+    assert live.html is not None and "<h2>Team plan</h2>" in live.html
+    stored = await get_document(
+        fetcher, Settings(), site.url("/article"), cache=cache, with_html=True
+    )
+    assert stored.page.cached and stored.html == live.html
+    assert site.hits("/article") == 1
+    skipped = await get_document(fetcher, Settings(), site.url("/article"), cache=cache)
+    assert skipped.page.cached and skipped.html is None  # not asked for, not read
+
+
+async def test_a_fetched_page_hands_back_its_html_only_when_asked(make_site, setup) -> None:
+    site: FixtureSite = make_site()
+    fetcher, cache, _ = setup()
+    live = await get_document(fetcher, Settings(), site.url("/article"), cache=cache)
+    assert not live.page.cached and live.html is None
+    kept = await get_document(
+        fetcher, Settings(), site.url("/article"), cache=cache, with_html=True
+    )
+    assert kept.page.cached and kept.html is not None  # stored all the same
+    assert site.hits("/article") == 1
+
+
+async def test_a_revalidated_page_keeps_its_html(make_site, setup) -> None:
+    site: FixtureSite = make_site()
+    fetcher, cache, clock = setup(ttl=60)
+    first = await get_document(fetcher, Settings(), site.url("/etag"), cache=cache, with_html=True)
+    clock.now += 61
+    again = await get_document(fetcher, Settings(), site.url("/etag"), cache=cache, with_html=True)
+    assert site.hits("/etag") == 2  # a download and a 304
+    assert again.page.cached and again.html == first.html and first.html is not None
+
+
+async def test_the_html_comes_back_even_with_the_cache_off(make_site, setup) -> None:
+    site: FixtureSite = make_site()
+    fetcher, cache, _ = setup(ttl=0)
+    for _ in range(2):
+        doc = await get_document(
+            fetcher, Settings(), site.url("/article"), cache=cache, with_html=True
+        )
+        assert doc.html is not None and "Team plan" in doc.html
+    assert site.hits("/article") == 2
+
+
+async def test_a_large_page_round_trips_through_compression(make_site, setup) -> None:
+    site: FixtureSite = make_site()
+    fetcher, cache, _ = setup()
+    live = await get_document(fetcher, Settings(), site.url("/big"), cache=cache, with_html=True)
+    stored = await get_document(fetcher, Settings(), site.url("/big"), cache=cache, with_html=True)
+    assert live.html is not None and len(live.html) > 200_000
+    assert stored.html == live.html
+
+
+async def test_an_error_page_is_not_stored_but_its_html_is_returned(make_site, setup) -> None:
+    site: FixtureSite = make_site()
+    fetcher, cache, _ = setup()
+    for _ in range(2):
+        doc = await get_document(
+            fetcher, Settings(), site.url("/status/404"), cache=cache, with_html=True
+        )
+        assert doc.page.status == 404 and not doc.page.cached
+        assert doc.html is not None and "Gone" in doc.html
+    assert site.hits("/status/404") == 2

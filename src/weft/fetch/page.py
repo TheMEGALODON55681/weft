@@ -10,6 +10,7 @@ import logging
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Literal
 
 from selectolax.lexbor import LexborHTMLParser
@@ -48,14 +49,15 @@ def wants_render(html: str, markdown: str, min_words: int) -> bool:
     return any("javascript" in n.text().lower() for n in tree.css("noscript"))
 
 
-def _read_http(res: FetchResult, min_words: int) -> tuple[Extracted, bool]:
+def _read_http(res: FetchResult, min_words: int) -> tuple[str, Extracted, bool]:
     html = decode_body(res.body, res.charset)
     page = extract_page(html, res.final_url)
-    return page, wants_render(html, page.markdown, min_words)
+    return html, page, wants_render(html, page.markdown, min_words)
 
 
-async def _off_loop[T](settings: Settings, fn: Callable[[], T]) -> T:
-    """Decoding and parsing are CPU-bound; keep them off the event loop, under a timeout."""
+async def off_loop[T](settings: Settings, fn: Callable[[], T]) -> T:
+    """Decoding, parsing and ranking are CPU-bound; keep them off the event loop, under a
+    timeout."""
     try:
         async with asyncio.timeout(settings.extract_timeout_s):
             return await asyncio.get_running_loop().run_in_executor(_EXTRACT_POOL, fn)
@@ -77,6 +79,47 @@ def _from_cache(entry: CacheEntry, url: str, start: float) -> PageResult:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class Document:
+    """A page and, if it was asked for, the HTML its Markdown was extracted from: the rendered
+    DOM when the browser was used, else the decoded body."""
+
+    page: PageResult
+    html: str | None
+
+
+async def get_document(
+    fetcher: Fetcher,
+    settings: Settings,
+    url: str,
+    render: RenderMode = "auto",
+    browser: BrowserPool | None = None,
+    cache: PageCache | None = None,
+    timeout_s: float | None = None,
+    with_html: bool = False,
+) -> Document:
+    start = time.perf_counter()
+    entry = key = None
+    if cache is not None:
+        try:
+            key = canonicalize(url)
+        except ValueError:
+            pass  # the fetch below reports the bad URL
+        else:
+            entry = await cache.get(key, render, with_html)
+            if entry is not None and entry.fresh:
+                return Document(_from_cache(entry, url, start), entry.html)
+    headers = entry.validators() if entry else None
+    res = await fetcher.fetch(url, headers=headers, timeout_s=timeout_s)
+    if res.status == 304 and entry is not None and cache is not None and key is not None:
+        await cache.refresh(key, render)
+        return Document(_from_cache(entry, url, start), entry.html)
+    page, html = await _build(res, settings, render, browser, start)
+    if cache is not None and key is not None:
+        await cache.put(key, render, page, res.etag, res.last_modified, html)
+    return Document(page, html if with_html else None)
+
+
 async def get_page(
     fetcher: Fetcher,
     settings: Settings,
@@ -86,26 +129,7 @@ async def get_page(
     cache: PageCache | None = None,
     timeout_s: float | None = None,
 ) -> PageResult:
-    start = time.perf_counter()
-    entry = key = None
-    if cache is not None:
-        try:
-            key = canonicalize(url)
-        except ValueError:
-            pass  # the fetch below reports the bad URL
-        else:
-            entry = await cache.get(key, render)
-            if entry is not None and entry.fresh:
-                return _from_cache(entry, url, start)
-    headers = entry.validators() if entry else None
-    res = await fetcher.fetch(url, headers=headers, timeout_s=timeout_s)
-    if res.status == 304 and entry is not None and cache is not None and key is not None:
-        await cache.refresh(key, render)
-        return _from_cache(entry, url, start)
-    page = await _build(res, settings, render, browser, start)
-    if cache is not None and key is not None:
-        await cache.put(key, render, page, res.etag, res.last_modified)
-    return page
+    return (await get_document(fetcher, settings, url, render, browser, cache, timeout_s)).page
 
 
 async def _build(
@@ -114,20 +138,23 @@ async def _build(
     render: RenderMode,
     browser: BrowserPool | None,
     start: float,
-) -> PageResult:
+) -> tuple[PageResult, str]:
+    """The page, and the HTML it was extracted from (empty for an error page that is not HTML)."""
     # An absent Content-Type is treated as HTML, as browsers do.
     if res.content_type and res.content_type not in _HTML_TYPES:
         if res.status >= 400:  # an error page is a result whatever its type; there is no text
             empty = Extracted(None, "", PageMetadata(), [])
-            return _result(res, empty, res.final_url, res.truncated, "http", start, settings)
+            return _result(res, empty, res.final_url, res.truncated, "http", start, settings), ""
         raise FetchError(
             "unsupported_content_type",
             f"{res.content_type} (HTTP {res.status}) is not HTML",
         )
     if render != "always":
-        page, wanted = await _off_loop(settings, lambda: _read_http(res, settings.render_min_words))
+        html, page, wanted = await off_loop(
+            settings, lambda: _read_http(res, settings.render_min_words)
+        )
         if render == "never" or not wanted:
-            return _result(res, page, res.final_url, res.truncated, "http", start, settings)
+            return _result(res, page, res.final_url, res.truncated, "http", start, settings), html
     try:
         if browser is None:
             raise FetchError("render_unavailable", "this server has no browser")
@@ -137,10 +164,11 @@ async def _build(
             raise
         # auto is best effort: the plain page is still an answer.
         log.info("render skipped", extra={"url": safe_url(res.final_url), "code": exc.code})
-        return _result(res, page, res.final_url, res.truncated, "http", start, settings)
-    rendered = await _off_loop(settings, lambda: extract_page(shot.html, shot.final_url))
+        return _result(res, page, res.final_url, res.truncated, "http", start, settings), html
+    rendered = await off_loop(settings, lambda: extract_page(shot.html, shot.final_url))
     truncated = res.truncated or shot.truncated
-    return _result(res, rendered, shot.final_url, truncated, "browser", start, settings)
+    result = _result(res, rendered, shot.final_url, truncated, "browser", start, settings)
+    return result, shot.html
 
 
 def _result(

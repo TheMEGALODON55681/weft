@@ -102,6 +102,24 @@ _MIGRATIONS = [
         PRIMARY KEY (url, render)
     ) WITHOUT ROWID;
     """,
+    # Version 3: the cache keeps the HTML that each page's Markdown was extracted from, so
+    # extraction rules can run on it later. A cache can be rebuilt and the old rows have no HTML,
+    # so the table starts empty. Jobs and frontier rows are untouched. No WITHOUT ROWID: SQLite
+    # advises against it for rows that hold large blobs.
+    """
+    DROP TABLE pages;
+    CREATE TABLE pages (
+        url           TEXT NOT NULL,  -- canonical form of the requested URL
+        render        TEXT NOT NULL,  -- the render mode it was fetched with
+        result        TEXT NOT NULL,  -- PageResult as JSON
+        html          BLOB NOT NULL,  -- zlib-compressed UTF-8: the document the Markdown came from
+        etag          TEXT,
+        last_modified TEXT,
+        fetched_at    REAL NOT NULL,
+        expires_at    REAL NOT NULL,
+        PRIMARY KEY (url, render)
+    );
+    """,
 ]
 SCHEMA_VERSION = len(_MIGRATIONS)
 

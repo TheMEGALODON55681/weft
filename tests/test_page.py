@@ -9,7 +9,7 @@ from weft.config import Settings
 from weft.fetch.browser import BrowserPool
 from weft.fetch.errors import FetchError
 from weft.fetch.http import Fetcher
-from weft.fetch.page import get_page, wants_render
+from weft.fetch.page import get_document, get_page, wants_render
 
 
 @pytest.fixture
@@ -172,6 +172,24 @@ async def test_auto_renders_a_javascript_shell(page_of, chromium) -> None:
     assert p.fetch_method == "browser"
     assert "Rendered report" in p.markdown
     assert p.final_url.endswith("/js-shell")
+
+
+async def test_the_html_of_a_rendered_page_is_the_dom_its_text_came_from(
+    site: FixtureSite, chromium
+) -> None:
+    settings = Settings()
+    fetcher = Fetcher(settings)
+    pool = BrowserPool(settings, fetcher)
+    try:
+        doc = await get_document(
+            fetcher, settings, site.url("/js-shell"), "auto", pool, with_html=True
+        )
+    finally:
+        await pool.aclose()
+        await fetcher.aclose()
+    assert doc.page.fetch_method == "browser"
+    # The script's source holds the same words in a string. Only the DOM has them as elements.
+    assert doc.html is not None and '<div id="root"><article>' in doc.html
 
 
 async def test_never_returns_the_shell_as_fetched(page_of) -> None:

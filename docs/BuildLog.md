@@ -385,3 +385,116 @@ Extend the fixture site with a crawlable site, two infinite link traps, a
 near-duplicate pair, a canonical alias and sitemaps, and test a real kill
 and resume. Docs updated.
 ```
+
+## Phase 5: retrieval (2026-11-21)
+
+### Done
+
+Passage ranking, `search_in_site` and `extract`, with embedding rerank and model extraction as optional extras behind config flags. Also the Phase 4 gap: an end-to-end test that fails when anchor text stops steering the crawl. New modules: `rank/passages.py`, `rank/rerank.py`, `extract/schema.py`, `extract/llm.py`, `providers.py` and `retrieval.py`. Schema version 3, ten settings, two MCP tools, and 601 tests. Three dependencies were added (`lxml`, `cssselect`, `jsonschema`). Nothing was committed, tagged or pushed.
+
+The task was not in the PRD. It was given as: passage splitting and BM25 reusing `rank/`, `search_in_site` returning ranked passages with source URL and snippet, `extract(url_or_job, schema)` validating against a user JSON Schema with CSS and XPath rules first, optional embedding rerank and model extraction off by default behind a provider interface, no network in tests.
+
+### Verification
+
+- `pytest`: 601 passed in 250 seconds, no warnings. The suite was 461 tests at the end of Phase 4. The Phase 5 tests need no browser except one in `test_page.py`, which launched a real headless Chromium and left nothing behind.
+- `ruff check .` and `ruff format --check .`: clean
+- `mypy` (strict, `src/weft`): clean
+- `uv build`: sdist and wheel built. The wheel holds `retrieval.py`, `providers.py`, `rank/passages.py`, `rank/rerank.py`, `extract/schema.py` and `extract/llm.py`, and its metadata requires `lxml`, `cssselect` and `jsonschema`.
+- Real stdio. `python -m weft` started as a child process and driven by a client script against the fixture site. Eight tools listed. `search_in_site` for "pricing team plan seat" crawled 8 pages, searched 14 passages and returned the pricing page's team-plan passage first (score 6.0), then its annual billing passage, then the enterprise page. `extract` over a crawl of the job board returned both roles with their titles and salaries, checked three pages, matched two, and sent no request to the site (the pages came from the cache). A schema with `"type": "strng"` and one with the selector `div[` were both refused as `invalid_schema`, with the place and the problem.
+- Mutation checks. 118 hand-written mutants of the Phase 5 code in five groups: the schema extractor (26), providers, rerank, the model fallback and settings (28), passages and the tokenizer (24), the HTML cache (11), and the retrieval code and server tools (29). Each is applied in a scratch copy of `src` and run against the tests meant to catch it, and the unmutated selection must pass first. The first run covered 117 and caught 85. The 32 survivors were read one by one: 31 were gaps in the tests and are closed (see Problems hit), and one is equivalent. A mutant for the trimming fix was added after. Final: 117 of 118 caught, and the survivor is the equivalent one.
+- Phase 4 gap. `test_anchor_text_alone_decides_which_link_is_fetched_first` fails with the anchor weight at zero, with the scorer given an empty anchor and with the crawler passing none (3 of 3). The old `test_the_goal_is_crawled_first` catches none of them.
+- No network. Providers are in-memory fakes, or `httpx.MockTransport`. The server tests give settings whose endpoint cannot resolve, so a call that reached for it would fail.
+- Processes. After the last full run there is no `python`, `chrome` or `playwright` process. Two `node.exe` processes remain, which no test started (the count moved between one and four while I worked).
+- Environment. `cssselect` was installed into `.venv` (`uv pip install cssselect`) while the code was written, since it was not a dependency before. It is in `pyproject.toml` now. There is no lockfile.
+- Not verified: a real model or embedding endpoint (no key, and the tests must not touch the network), Linux and Docker (Phase 6), extraction over crawls of thousands of pages, and memory use under load (Phase 7).
+
+### Decisions
+
+- **The cache stores the HTML.** The Phase 4 notes said `extract` could read a job's pages from the cache. The cache held only Markdown, and CSS and XPath need the DOM, so each row now holds the page's HTML, compressed, and `get_document` returns it. It is the rendered DOM for a page that went through the browser, so rules see what a visitor sees. Rows are about ten times larger. The alternative was to fetch every page again for `extract`, which breaks the promise that a search costs few requests.
+- **Rules live inside the JSON Schema.** `x-css`, `x-xpath` and `x-attr` are annotations, which JSON Schema ignores, so the user's schema is still an ordinary schema that any validator accepts. The other design was a second document of selectors next to the schema, which would have to be kept in step.
+- **One lxml tree for CSS and XPath.** `cssselect` translates CSS to XPath, so both kinds run on the same tree and mix in one schema. Running CSS on selectolax and XPath on lxml would have parsed every page twice and made a schema that mixes them impossible.
+- **`jsonschema` validates the rule output.** Rules build data and validation says whether it is acceptable, so one mechanism serves the rules, the model fallback and the error messages. Errors are cut to ten, each 300 characters, as `path: problem`.
+- **Rules first, the model only when they fall short.** A model call costs money and sends page text off the machine. A page the rules satisfy never reaches it. A model answer replaces the rules' only if it validates against the same schema, so a wrong shape can never get through, and an invalid one leaves the rules' result with a note. One call asks about at most ten pages.
+- **The flag is the switch.** A fake provider given to `build_server` is ignored when its flag is off, as a configured one would be. A test shows it, because otherwise a feature could run while its setting said off.
+- **A provider failure means carry on.** Rerank falls back to the keyword order with `reranked: false`. Model extraction leaves the rules' result with an `llm:` error. A provider error never fails the tool, and never holds a key or a response body.
+- **Rerank by rank fusion.** Reciprocal rank fusion needs no common scale for the two scores, no weight and no numpy (`math.sumprod`). It reorders the best 50 keyword hits and cannot add recall. Adding recall would mean embedding every passage of every page.
+- **HTTP only, no local model.** One client speaks the chat-completions and embeddings API that hosted and local servers offer, so a local server needs only a base URL. A `sentence-transformers` provider would add a dependency of gigabytes for one flag. The Protocol leaves room for it.
+- **Vendor and model names stay out of code and docs.** The README describes the API by what it is. The model names in the config sample are placeholders.
+- **The endpoints are operator-set and not behind the address guard.** An operator who points Weft at a server on their own network means it. No tool argument can name an endpoint, which is what keeps the guard out of the picture. If that changes, the guard comes first.
+- **`search_in_site` is a crawl job.** It reuses the job machinery, progress, politeness and resume, at the price of one job per call, which is never deleted. It reads the pages back through the cache with the job's own render mode, so the read costs no request.
+- **Extraction over a job returns only the pages that match.** On a site of mixed pages most are not the kind asked for, and hundreds of invalid items would bury the few good ones. The counters (`pages_checked`, `pages_matched`, `pages_unreadable`) say how far it got. It reads most relevant first and stops at `limit` matches.
+- **Passages carry their heading, and the page title counts as words.** A passage that says "twelve dollars per seat" under the heading "Team plan" is a hit for "team plan pricing", though none of those words is in the sentence.
+- **A tokenizer for words, not for ASCII.** `[^\W_]+` keeps `für` and `цена` whole. The ASCII-only one split them into single letters and dropped them, which would have made every German, French or Russian page unsearchable. It also changes the crawl's scoring for such pages. CJK and Thai still come out as one long token.
+- **What a run may collect is bounded by an existing limit.** `max_content_chars`, the cap on what one page may return, is also the cap on the text a rule run gathers.
+- **A page with an error status is run through the selectors like any other.** The fetch tools return error pages as results, so `extract` does too. The cost is a wasted model call on a 404 when the model is on. A one-line status check would remove it. It was not added because nothing asked for it.
+
+### Problems hit
+
+- **The first mutation run caught 85 of 117.** The tests for the new modules passed on their first run, written before the code and seen red only for a missing module. That showed they ran. It did not show that each assertion could fail. The 32 survivors were read one by one. Most were boundary tests that stopped one character short or never reached the branch: the 7-hash heading, a selector of exactly the longest length, a negative number, a `src` attribute, the order of validation errors, a model reply nested too deep for `json`, an upper-case `HTTPS` in an endpoint, and a snippet that is cut or not. Some tests passed for the wrong reason. The zero-vector rerank test gave the same order with or without the guard. The redirect test supplied its own HTTP client, so it never touched the one the code builds. Two tests of key handling never read the key. A snippet test passed with the lead-in set to zero. Two mutants changed a limit that the test imported (the node count and the schema size), so the test moved with them. Each now has a test that fails on its mutant, and the two limit tests use the published numbers. One survivor is equivalent: it makes `search_in_site` read pages in the `auto` render mode whatever the job says, and `search_in_site` has no `render` argument, so the job always says `auto`.
+- **A test counted hits on a session-wide fixture.** The "refused before any request" tests asserted `site.total_hits == 0`, but the fixture site is shared by the whole session, so the count included earlier tests. They compare with a count taken at the start now.
+- **A cap test crawled too little.** It meant to show that a job with more than ten pages asks the model about ten. At depth 1 the fixture site yields seven pages, so the test checked nothing. It crawls deeper now.
+- **A scripted edit broke a test module.** A Python heredoc turned the `\n` in a test string into a real newline. `ruff check` caught the unterminated string at once, and the edit was redone with raw strings. A large shell heredoc with apostrophes had failed the same way before, so file content goes through the editor tools.
+- **A selector could build an answer far bigger than the page.** Found in review, not by a test. See Review.
+- **A provider that drips bytes would never time out.** Found in review. See Review.
+- **`tests/test_server.py` could not be collected for most of the build.** It was written first and imported a module that did not exist yet, so the whole file, the Phase 1 to 4 tests included, errored at collection until `retrieval.py` and the server wiring landed. That was the intended red state, and the reason none of it could be run in between.
+
+### Review
+
+I reviewed the code in this session from four angles (correctness, security, concurrency, maintainability) and reconciled the findings, then ran an over-engineering review.
+
+Fixed:
+
+- **Unbounded output from a selector.** Found by the security pass. `div` on a page of nested divs matches the same text at every level, so a few kilobytes of hostile HTML could produce a response hundreds of times larger. The run now counts characters as it collects them and stops at `max_content_chars`. A test shows 50 nested divs and the exact boundary.
+- **No wall-clock limit on a provider call.** Found by the concurrency pass. The HTTP client's timeouts apply per read, so a server that sends a byte at a time would hold an `extract` call as long as it liked. Fixed, with a test using a transport that never answers.
+- **`url_or_job` was not trimmed, and an upper-case scheme was not a URL.** Found by the correctness pass and by a surviving mutant. `HTTPS://example.org` and a URL with a leading space were taken for job ids and answered `unknown_job`. The value is trimmed and the scheme compared in lower case. A test covers both.
+- **An unused property on `AppState`.** Found by the over-engineering pass. Deleted.
+- **Over-engineering review.** Kept: the `_Extraction` class (it holds the call's model budget, which a bare function would pass around as a parameter), `Document` (a pair, but the two always travel together), the two Protocols (tests inject fakes through them), and `get_page` next to `get_document` (many callers). Declined with a reason: a per-page token budget for the model (the character limit does the job), a `render` argument on `search_in_site` (`crawl_site` then `extract` covers it), concurrent model calls (the cap of ten makes sequential acceptable), and a status check that skips error pages (see Decisions).
+
+Accepted and recorded, not fixed:
+
+- No local embedding model. Rerank cannot add recall.
+- English-only stemming and stop words. CJK and Thai are not segmented. No accent folding.
+- A passage is a repeat only if the whole passage repeats.
+- Every `search_in_site` call starts a job, and jobs and cache rows are never deleted. The `pages` table is about ten times larger.
+- Ranking happens in one pass under `extract_timeout_s`.
+- An agent's `pattern` or XPath can hold one of the four extraction threads.
+- A model can be made to copy misleading page text into a free-text field. Validation is the only bound.
+- The model calls of one `extract` call run in sequence.
+- Phase 4 carry-overs unchanged.
+
+The jury was again one reviewer playing four roles. The parts most worth an outside read are the schema extractor (`extract/schema.py`, which runs the agent's selectors over a stranger's HTML) and the provider client's handling of a hostile or slow endpoint.
+
+### Commit message draft
+
+```
+Phase 5: passage search, schema extraction and optional model providers
+
+Add search_in_site, which crawls toward a query as a job, reads the pages
+back through the cache and returns the best passages with the URL, title,
+heading and a snippet. Passages are cut at headings and sentence ends and
+ranked with the BM25 the crawl already uses, with the title and heading
+counted as words of the passage. The tokenizer now reads words in any
+script that separates them with spaces.
+
+Add extract, which returns JSON that validates against a user JSON Schema,
+read from a URL or from the pages of a job. Selectors are written into the
+schema as x-css, x-xpath and x-attr, run on one lxml tree so CSS and XPath
+mix, and the result is validated with jsonschema. Schema size, nesting and
+selector length are bounded, a reference may not leave the schema, and a
+run stops at max_content_chars of collected text.
+
+Add a provider interface with one HTTP client for embeddings and chat. Both
+features are off by default behind config flags, with the endpoint set by
+the operator only, and never called in tests. Embedding rerank fuses the
+keyword and similarity ranks of the best 50 hits and falls back to the
+keyword order on any provider error. Model extraction runs only when the
+rules fall short, for at most ten pages per call, and its answer is used
+only if it validates.
+
+Store each cached page's HTML, compressed, so extraction rules can read
+the rendered DOM. Migrate the schema to version 3, which drops cached pages.
+
+Close the Phase 4 gap: an end-to-end crawl test that fails when anchor text
+stops steering the order. Add cssselect, lxml and jsonschema as
+dependencies. Docs updated.
+```

@@ -8,7 +8,7 @@ Build order is fixed. Each phase is finished, tested and documented before the n
 | 2 | Safety and politeness: robots.txt, rate limits, SSRF guard, retries, circuit breaker | Done |
 | 3 | Rendering: Playwright pool, auto-escalation policy | Done |
 | 4 | Crawling: frontier, goal scoring, dedupe, `crawl_site`, `map_site`, jobs, resume | Done |
-| 5 | Retrieval: passage ranking, `search_in_site`, schema `extract` | Next |
+| 5 | Retrieval: passage ranking, `search_in_site`, schema `extract`, optional rerank and model extraction | Done |
 | 6 | Remote: streamable HTTP transport, bearer auth, Docker, `/healthz` | Not started |
 | 7 | Hardening: load test, fuzzing, docs polish | Not started |
 
@@ -106,14 +106,40 @@ Left for later:
 - Sitemaps with namespace prefixes on their tags (`<s:loc>`) are not read.
 - `same_domain_only` treats `www.` as the same site and every other subdomain as a different one. A public-suffix-aware site key would be more exact.
 - Two servers on one data directory would both resume the same jobs.
+- The anchor-text weight was not tested end to end. The old goal-order test passed with the weight set to zero, because the goal also appears in the page text and URLs. Closed in Phase 5: `test_anchor_text_alone_decides_which_link_is_fetched_first` uses four links that differ only by anchor text, and fails with the weight zeroed, with the scorer given no anchor, and with the crawler passing no anchor.
 
-## Phase 5: next
+## Phase 5: done
 
-Scope: passage ranking, `search_in_site`, schema `extract`.
+Delivered:
 
-Starting points left by Phase 4:
+- Passage splitting and ranking (`rank/passages.py`) on the existing BM25 (`rank/bm25.py`): cut at headings, short lines gathered up to a size, long ones cut at sentence ends, title and heading counted as words of the passage, exact repeats dropped, a snippet around the query words. The tokenizer now reads words in any script that separates them with spaces, where it used to drop everything outside ASCII.
+- `search_in_site`: a crawl job with the query as its goal, then a passage search over the pages it kept, returning hits with URL, title, heading, snippet and passage, and saying whether the crawl finished.
+- `extract` (`extract/schema.py`, `retrieval.py`): a JSON Schema with `x-css`, `x-xpath` and `x-attr` selectors, run on one lxml tree so CSS and XPath mix, validated with `jsonschema`, over a URL or the pages of a job. Errors name the path and the problem. Limits on schema size, depth, selector length and the text a run may collect.
+- A provider interface (`providers.py`) with one HTTP implementation for embeddings and chat, both off by default behind config flags, with the endpoint set by the operator only.
+- Optional embedding rerank (`rank/rerank.py`): reciprocal rank fusion of the keyword rank and the similarity rank over the best 50 hits. A provider failure keeps the keyword order.
+- Optional model extraction (`extract/llm.py`): asked only when the rules fall short, at most 10 pages per call, and its answer is used only if it validates.
+- The page cache now keeps each page's HTML (compressed), and `get_document` returns it, so rules can read the rendered DOM. Schema version 3.
+- The Phase 4 anchor-text gap, closed (see Phase 4).
+- No network in tests: providers are in-memory fakes or an in-memory HTTP transport.
+- Tests, lint, types and the hand-made mutants: see BuildLog.
 
-- `rank/bm25.py` holds BM25 with a growing corpus and a small stemmer. Passage ranking can reuse it on passages instead of pages.
-- `search_in_site` can run as a crawl job with the query as its goal. The pages it keeps are in the frontier, and their full text is in the page cache.
-- `extract(url_or_job, schema)` can read a job's pages from the cache by URL, as `fetch_page` does after a crawl.
-- The cache is keyed by render mode. A search that renders differently from the crawl that filled the cache will fetch again.
+Corrections to the notes Phase 4 left for this phase:
+
+- `extract` cannot read a job's pages from the cache as Markdown. CSS and XPath need the DOM, and the cache held only the Markdown. The cache now stores the HTML too, at the price of rows about ten times larger. Migration 3 dropped the cached pages to add the column.
+- A search that renders differently from the crawl does fetch again. `search_in_site` uses the job's own render mode, so it never does. `extract` over a job does the same.
+
+Left for later:
+
+- No local embedding model, only the HTTP endpoint. A `sentence-transformers` provider would fit behind the same interface, at the price of a large dependency.
+- Rerank orders the keyword hits and does not add recall. Passages that share no word with the query are not found.
+- Stemming and stop words are English only. Chinese, Japanese and Thai are not segmented. Accents are not folded.
+- A passage is dropped as a repeat only when the whole passage repeats. Boilerplate that differs by a word is kept.
+- Each `search_in_site` call starts a job and jobs are never deleted. Search with the cache off fetches every page twice, and with `cache_ttl_s = 0` extraction over a job fetches every page again.
+- The `pages` table is about ten times larger and is never swept.
+- Ranking a very large search happens in one pass under `extract_timeout_s`.
+- Agent-supplied XPath and JSON Schema `pattern` values can hold one of the four extraction threads, the same ceiling as Phase 2.
+- A model cannot be stopped from putting misleading page text into a field that takes any string. Validation against the schema is the only bound.
+- Model and embedding endpoints are not covered by the address guard. They are operator-set. If Weft ever takes endpoints from a caller, they need it.
+- The extraction calls of one `extract` call run in sequence.
+- A page with an error status is run through the selectors, and through the model if that is on, like any other page.
+- Phase 4 carry-overs are unchanged.

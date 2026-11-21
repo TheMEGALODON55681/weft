@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -89,6 +89,38 @@ class Settings(BaseSettings):
     # Per-host limiter and breaker state is kept for this many hosts, least recently used first
     # out. Hosts that are mid-request, still owed spacing or have an open breaker are kept.
     max_tracked_hosts: int = Field(default=4096, gt=0)
+
+    # Optional model providers, both off. Each flag needs its endpoint and model. An endpoint
+    # speaks the chat-completions and embeddings HTTP API that most hosted and local model servers
+    # offer. It is set here and nowhere else, so an agent cannot choose it, and calls to it do not
+    # go through the SSRF guard. Text from crawled pages is sent there when a feature is on, which
+    # is why both are off by default. Keys are best kept in the environment, not in a file.
+    embedding_base_url: str = ""
+    embedding_model: str = ""
+    embedding_api_key: SecretStr | None = None
+    embedding_rerank: bool = False  # rerank search_in_site hits by meaning, after BM25
+    llm_base_url: str = ""
+    llm_model: str = ""
+    llm_api_key: SecretStr | None = None
+    llm_extraction: bool = False  # extract falls back to a model when the rules find too little
+    llm_max_input_chars: int = Field(default=30_000, gt=0)  # of page text sent to the model
+    provider_timeout_s: float = Field(default=60.0, gt=0)
+
+    @field_validator("embedding_base_url", "llm_base_url")
+    @classmethod
+    def _http_endpoint(cls, value: str) -> str:
+        if value and not value.lower().startswith(("http://", "https://")):
+            raise ValueError("must start with http:// or https://")
+        return value
+
+    # Declared after the endpoint fields so that `info.data` already holds them.
+    @field_validator("embedding_rerank", "llm_extraction")
+    @classmethod
+    def _needs_an_endpoint(cls, on: bool, info: ValidationInfo) -> bool:
+        prefix = "embedding" if info.field_name == "embedding_rerank" else "llm"
+        if on and not (info.data.get(f"{prefix}_base_url") and info.data.get(f"{prefix}_model")):
+            raise ValueError(f"{info.field_name} needs {prefix}_base_url and {prefix}_model")
+        return on
 
     @property
     def db_path(self) -> Path:

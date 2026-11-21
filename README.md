@@ -4,7 +4,9 @@ Weft is a web crawler that AI agents can call. It runs as an MCP server, fetches
 
 It also crawls. Give it seed URLs and a goal in plain language ("find pricing pages"), and it follows the links most likely to lead there first, skips duplicates and crawler traps, and ranks what it found against the goal. Crawls run as background jobs that survive a restart. `map_site` lists a site's URLs from its sitemaps without crawling.
 
-This repository is at Phase 4 of 7. Six tools run over stdio: `fetch_page`, `crawl_site`, `get_job`, `cancel_job`, `list_jobs` and `map_site`. Passage search and schema extraction come next. [docs/Phases.md](docs/Phases.md) lists what each phase adds.
+It can also answer a question about a site. `search_in_site` crawls toward the question and returns the best passages, each with the URL and a snippet. `extract` pulls structured data out of a page, or out of every page of a crawl, as JSON that validates against a schema you write, using CSS and XPath selectors. Two optional extras, both off by default, rerank search hits by meaning and let a language model read a page when the selectors find too little.
+
+This repository is at Phase 5 of 7. Eight tools run over stdio: `fetch_page`, `crawl_site`, `get_job`, `cancel_job`, `list_jobs`, `map_site`, `search_in_site` and `extract`. The remote transport comes next. [docs/Phases.md](docs/Phases.md) lists what each phase adds.
 
 ## Install
 
@@ -104,7 +106,9 @@ When a fetch yields nothing usable, the tool returns an error whose message star
 | `extraction_timeout` | Reading the page took longer than `extract_timeout_s`. | No |
 | `render_unavailable` | `render="always"`, and headless Chromium is not installed or would not start. | No |
 | `render_failed` | `render="always"`, and the page crashed the browser tab, for example by passing `browser_js_heap_mb`. | No |
-| `unknown_job` | `get_job` or `cancel_job` got an id that no job has. | No |
+| `unknown_job` | `get_job`, `cancel_job` or `extract` got an id that no job has. | No |
+| `invalid_query` | `search_in_site` got a query with no searchable word, such as "the of". | No |
+| `invalid_schema` | `extract` got a schema that is not valid JSON Schema, has a bad selector, points outside itself with `$ref`, or is too large or nested. The message says where. | After fixing it |
 
 ### `crawl_site(seed_urls, goal="", max_pages=50, max_depth=3, include_patterns=[], exclude_patterns=[], same_domain_only=true, render="auto", wait_s=20)`
 
@@ -171,9 +175,108 @@ Lists a site's URLs without crawling it. Weft reads the `Sitemap:` lines in the 
 
 Only a failure to fetch the start page is an error. Sitemap failures are reported per file.
 
+### `search_in_site(url, query, max_pages=20, limit=10, wait_s=30)`
+
+Crawls a site from a start page, steered by the query, and returns the passages that best answer it. It is `crawl_site` with the query as the goal, followed by a passage search over the pages the crawl kept. Each call starts a job you can read with `get_job`. Pages fetched recently come from the cache, so a repeat search costs few requests.
+
+| Argument | Meaning |
+| --- | --- |
+| `url` | Where to start, usually the site's home page. Same rules as a `crawl_site` seed. |
+| `query` | What to look for, in plain words, up to 500 characters. It needs at least one searchable word, or the call fails with `invalid_query` before anything is fetched. |
+| `max_pages` | Pages to crawl and search, 1 to 500. |
+| `limit` | Passages to return, 1 to 50. |
+| `wait_s` | How long to wait for the crawl, 0 to 300 seconds, with progress notifications. The crawl keeps going after that. |
+
+| Field | Meaning |
+| --- | --- |
+| `hits` | Best first. Each has `url` (the page's final URL: cite it), `title`, `heading` (the nearest heading above the passage), `snippet` (the stretch of the passage around the query words, up to 240 characters), `passage` (the whole passage) and `score`. |
+| `pages_searched` | Pages read for passages. |
+| `pages_unreadable` | Crawled pages that could not be read again, left out of the search. |
+| `passages_searched` | Passages ranked, after exact repeats were dropped. |
+| `reranked` | `true` when embeddings set the order, see [Optional models](#optional-models). |
+| `complete` | `true` when the crawl finished. If it is `false`, the hits cover the pages read so far: wait for the job with `get_job` and search again, or raise `wait_s`. |
+| `job` | The crawl job, as `get_job` returns it. |
+
+**How passages are ranked.** A page's Markdown is cut at headings. Short lines are gathered into passages of about 150 to 700 characters, and long lines are cut at sentence ends. The passages of every page form one corpus, and BM25 ranks them against the query, so a word that fills half the passages counts for little and a rare one for a lot. The page title and the heading count as words of the passage they sit over. A passage with no query word is not a hit. A passage that appears word for word on several pages counts once, at the first. Words are matched in any script that separates them with spaces, and English plurals and `-ing` forms are folded. Chinese, Japanese and Thai are not segmented, and accents are not folded.
+
+### `extract(url_or_job, schema, limit=50)`
+
+Pulls structured data out of one page, or out of the pages of a crawl job, as JSON that validates against your JSON Schema. You say where each value is by writing selectors into the schema.
+
+| Argument | Meaning |
+| --- | --- |
+| `url_or_job` | An absolute `http(s)` URL, or a job id from `crawl_site` or `search_in_site`. |
+| `schema` | A JSON Schema (draft 2020-12) with selectors in it, up to 50,000 characters. A bad schema fails with `invalid_schema` before anything is fetched. |
+| `limit` | For a job: stop after this many matching pages, 1 to 500. |
+
+**Selectors.** Three keywords that JSON Schema ignores as annotations:
+
+| Keyword | Meaning |
+| --- | --- |
+| `x-css` | A CSS selector. |
+| `x-xpath` | An XPath 1.0 expression. Use this or `x-css`, not both. |
+| `x-attr` | Take this attribute of the match instead of its text. `href` and `src` are made absolute. |
+
+A scalar takes the first match, with whitespace collapsed. A number is read out of the text around it, so `$80,500 a year` is `80500`. A boolean is whether the selector matched. An array takes every match. When an array's items are objects, each match is one record and the selectors inside it are relative to that match. An object with a selector is scoped to its first match, and one without keeps the scope it is in. A property with no selector is not extracted. CSS and XPath can be mixed in one schema. A schema may have 300 nodes (itself, its properties and its array items), 8 levels of nesting and 500 characters per selector. `$ref` works only inside the schema.
+
+```json
+{
+  "type": "array",
+  "x-css": "div.product",
+  "items": {
+    "type": "object",
+    "properties": {
+      "name": { "type": "string", "x-css": "h2" },
+      "price": { "type": "number", "x-css": ".price" },
+      "url": { "type": "string", "x-css": "a", "x-attr": "href" }
+    },
+    "required": ["name", "price"]
+  }
+}
+```
+
+The selectors read the rendered page when the page needed the browser, and the fetched HTML otherwise.
+
+| Field | Meaning |
+| --- | --- |
+| `source` | `"url"` or `"job"`. |
+| `job_id`, `job_status` | For a job: its id and its status now. |
+| `items` | One per page. Each has `url` (cite it), `data`, `valid`, `errors` and `method`. |
+| `pages_total` | Pages the source offered: 1 for a URL, the job's kept pages for a job. |
+| `pages_checked` | Pages read. A job is read most relevant page first and stops at `limit` matches, so this can be less than `pages_total`. |
+| `pages_matched` | Pages whose data is valid and not empty. |
+| `pages_unreadable` | Pages that could not be read again. |
+
+`valid` says whether `data` satisfies the schema. When it does not, `errors` lists up to ten problems as `path: problem`, such as `(root): 'salary' is a required property`, and `data` holds what the selectors did find, so you can correct them. For a URL the one item is always returned. For a job only the matching pages are, because on a site of mixed pages most are not the kind you asked for. A job's pages are read from the cache. A page whose entry has expired is asked for again.
+
+If the selectors would collect more than `max_content_chars` of text from one page, which a selector like `div` can do on a page of nested divs, the page is reported with an error instead of the data.
+
+`method` is `"rules"`, or `"llm"` when a model's answer was used. See [Optional models](#optional-models).
+
+## Optional models
+
+Both features are off. Each needs an endpoint and a model name, and turning one on without them fails at startup. The endpoint speaks the chat-completions and embeddings HTTP API that most hosted and local model servers offer, so a hosted service and a local server differ only in the base URL.
+
+```toml
+embedding_rerank = true
+embedding_base_url = "http://localhost:8080/v1"
+embedding_model = "your-embedding-model"
+
+llm_extraction = true
+llm_base_url = "http://localhost:8080/v1"
+llm_model = "your-chat-model"
+```
+
+Put keys in the environment (`WEFT_EMBEDDING_API_KEY`, `WEFT_LLM_API_KEY`) rather than the file.
+
+- **Rerank.** With `embedding_rerank` on, `search_in_site` embeds its query and its best 50 keyword hits, and orders them by the keyword rank and the similarity rank together (reciprocal rank fusion), so a strong keyword hit is not pushed out by a vague semantic one. It reorders the keyword hits. It does not find passages that share no word with the query. `score` is then the fused score, and `reranked` is `true`. If the provider fails, the keyword order is returned with `reranked: false`.
+- **Model extraction.** With `llm_extraction` on, `extract` asks the model about a page only when the selectors found too little to satisfy the schema, or the schema has none. The model gets the schema without its selectors, the page URL and the first `llm_max_input_chars` of the page's Markdown, and is told to treat the text as data. Its answer replaces the selectors' only if it validates against the schema. Otherwise the item stays `method: "rules"` and `errors` gains an `llm:` line. One call asks the model about at most 10 pages.
+
+Weft sends nothing to a model unless the flag is on. When it is on, text from the pages you search or extract goes to that endpoint. The endpoint is set here and cannot be chosen by an agent, and it is not checked by the address guard, because an operator who points Weft at a server on their own network means to. A provider error never reaches the agent with a key or a response body in it.
+
 ## The page cache
 
-Pages are stored in the SQLite file after each successful fetch, by canonical URL and render mode. For `cache_ttl_s` (an hour by default) the stored page is served without contacting the site. After that, if the site sent an `ETag` or `Last-Modified`, Weft asks with `If-None-Match` or `If-Modified-Since`, and a `304` reuses the stored page, a rendered one included. Otherwise the page is fetched again. Only `200` responses are stored. `cache_ttl_s = 0` turns the cache off.
+Pages are stored in the SQLite file after each successful fetch, by canonical URL and render mode. For `cache_ttl_s` (an hour by default) the stored page is served without contacting the site. After that, if the site sent an `ETag` or `Last-Modified`, Weft asks with `If-None-Match` or `If-Modified-Since`, and a `304` reuses the stored page, a rendered one included. Otherwise the page is fetched again. Only `200` responses are stored. `cache_ttl_s = 0` turns the cache off. Each entry also keeps the page's HTML, compressed (the rendered page, for one that went through the browser), because `extract` needs the document and the Markdown has lost its structure. Entries are about ten times larger for it. With the cache off, `search_in_site` and `extract` over a job fetch every page again.
 
 ## Safety and politeness
 
@@ -242,6 +345,16 @@ max_links = 100
 | `crawl_concurrency` | `4` | Fetches one job runs at a time. |
 | `crawl_max_jobs` | `2` | Jobs running at once. Others are `queued` until a slot frees. |
 | `max_tracked_hosts` | `4096` | Hosts whose pacing and breaker state is kept. The least recently used idle host is dropped first. A host that is mid-request, still owed spacing or has an open breaker is never dropped. |
+| `embedding_rerank` | `false` | Rerank `search_in_site` hits by embedding similarity. Needs `embedding_base_url` and `embedding_model`. |
+| `embedding_base_url` | empty | Base URL of the embeddings endpoint, `http://` or `https://`. Weft posts to `<base>/embeddings`. |
+| `embedding_model` | empty | Model name sent with each embeddings request. |
+| `embedding_api_key` | none | Sent as a bearer token when set. Redacted from logs. Better set as `WEFT_EMBEDDING_API_KEY`. |
+| `llm_extraction` | `false` | Let `extract` ask a model when the selectors find too little. Needs `llm_base_url` and `llm_model`. |
+| `llm_base_url` | empty | Base URL of the chat endpoint. Weft posts to `<base>/chat/completions`. |
+| `llm_model` | empty | Model name sent with each chat request. |
+| `llm_api_key` | none | Sent as a bearer token when set. Redacted from logs. Better set as `WEFT_LLM_API_KEY`. |
+| `llm_max_input_chars` | `30000` | Characters of a page's Markdown sent to the model. |
+| `provider_timeout_s` | `60` | Wall-clock limit for one call to either endpoint. |
 
 Each setting has an environment variable named `WEFT_` plus the uppercase setting name, for example `WEFT_MAX_LINKS`.
 
@@ -259,6 +372,15 @@ Each setting has an environment variable named `WEFT_` plus the uppercase settin
 - Near-duplicate detection is tuned for pages of a few hundred words. Pages under 30 words are compared by exact text only.
 - Relevance scores use corpus statistics from the pages a job has fetched. A resumed job starts those statistics again, so scores before and after a restart are not exactly comparable.
 - The page cache is shared by every caller of one server. That is safe while Weft sends no cookies. Authenticated crawls, when they arrive, must keep their pages out of it.
+- Search and extraction read pages back through the cache, so they depend on it. Each `search_in_site` call starts a new crawl job, and jobs are never deleted.
+- Search ranks every page of a call in one pass, under `extract_timeout_s`. A search over hundreds of very long pages can exceed it and fail with `extraction_timeout`: lower `max_pages`.
+- `extract` over a job reads its pages one after another, most relevant first, and stops at `limit` matches. On a job of thousands of pages where little matches, the call can take a minute or more. Crawl a smaller job, or call `extract` on the URLs one by one.
+- Reranking only reorders the keyword hits. Passages that share no word with the query are not found, and there is no local embedding model, only the HTTP endpoint.
+- Stemming and stop words are English only. A passage is dropped as a repeat only when the whole passage appears elsewhere word for word.
+- A JSON Schema `pattern` or a hostile XPath is run by Weft against page text, and a pathological one can hold one of the four extraction threads until it finishes, as with a page that hangs the extractor.
+- A model's answer is checked against your schema, and that is the only protection from a page that tries to steer it: a page can still put misleading text into a field that accepts any string. Treat extracted data as untrusted page content.
+- The model endpoints are not covered by the address guard and are not chosen by agents. The extraction calls for one `extract` call run one after another, so a slow endpoint can hold the call for up to ten times `provider_timeout_s`.
+- Migration 3 of the database drops the cached pages (jobs and frontier rows stay), so pages cached by an earlier version are fetched again.
 
 ## Development
 

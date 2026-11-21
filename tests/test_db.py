@@ -117,7 +117,46 @@ async def test_a_version_1_file_is_migrated_and_keeps_its_jobs(tmp_path: Path) -
         pages = await db.run(lambda c: {r[1] for r in c.execute("PRAGMA table_info(pages)")})
     finally:
         await db.close()
-    assert version == SCHEMA_VERSION == 2
+    assert version == SCHEMA_VERSION == 3
     assert job == ("old", 0)
     assert {"simhash", "duplicate_of", "relevance", "run"} <= frontier
-    assert {"url", "render", "result", "etag"} <= pages
+    assert {"url", "render", "result", "etag", "html"} <= pages
+
+
+async def test_a_version_2_file_keeps_its_jobs_and_loses_only_its_cached_pages(
+    tmp_path: Path,
+) -> None:
+    """Version 3 adds the page HTML to the cache. Pages cached before it have none, so the table
+    is rebuilt empty. Jobs and their frontier rows are untouched."""
+    from weft.db import _MIGRATIONS
+
+    path = tmp_path / "weft.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(f"BEGIN;{_MIGRATIONS[0]}{_MIGRATIONS[1]}PRAGMA user_version = 2;COMMIT;")
+    raw.execute(
+        "INSERT INTO jobs(id, kind, status, params, created_at, updated_at) "
+        "VALUES ('old', 'crawl', 'done', '{}', 1, 1)"
+    )
+    raw.execute(
+        "INSERT INTO frontier(job_id, url, depth, score, state, discovered_at) "
+        "VALUES ('old', 'http://a.test/', 0, 1.0, 'done', 1)"
+    )
+    raw.execute(
+        "INSERT INTO pages(url, render, result, fetched_at, expires_at) "
+        "VALUES ('http://a.test/', 'auto', '{}', 1, 2)"
+    )
+    raw.commit()
+    raw.close()
+
+    db = await Database.open(path)
+    try:
+        counts = await db.run(
+            lambda c: [
+                c.execute("SELECT count(*) FROM jobs").fetchone()[0],
+                c.execute("SELECT count(*) FROM frontier").fetchone()[0],
+                c.execute("SELECT count(*) FROM pages").fetchone()[0],
+            ]
+        )
+    finally:
+        await db.close()
+    assert counts == [1, 1, 0]
