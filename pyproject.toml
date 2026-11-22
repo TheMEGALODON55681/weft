@@ -12,8 +12,16 @@ dependencies = [
     # One major release, from the version the tests ran against. The HTTP transport leans on
     # fastmcp's auth and host-check options, which changed between majors.
     "fastmcp>=4.2.2,<5",
+    # Imported directly: starlette by the server (the /healthz route), uvicorn and mcp by the
+    # transport tests. fastmcp brings them either way, so these ranges stay inside its own.
+    "starlette>=1.0.1,<2",
+    "uvicorn>=0.35,<1",
+    "mcp>=2.3.0,<3",
     "httpx[http2]",
     "httpcore>=1.0,<1.1",
+    # httpcore imports it inside a function that runs several times per request. Without it each
+    # call searches sys.path again and fails: 40 to 50 fetches a second, against 200 to 240 with it.
+    "sniffio",
     "pydantic-settings",
     "selectolax",
     "trafilatura",
@@ -34,6 +42,7 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "cryptography",
+    "hypothesis",
     "ruff",
     "mypy",
 ]

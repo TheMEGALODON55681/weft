@@ -3,10 +3,24 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import ExitStack
 
 import pytest
+from hypothesis import HealthCheck, settings
 
 from fixture_site import FixtureSite, run_site
+from skips import skip_or_fail
 from weft.config import Settings
 from weft.fetch.http import Fetcher
+
+# The fuzz tests (test_fuzz.py). The default run draws the same 1000 examples every time (a tenth
+# of that for the HTML tests, which are slow), so
+# a red build means a code change and not a lucky draw. WEFT_FUZZ_EXAMPLES=20000 draws that many
+# from a random seed, for a deep run before a release. No example database: a clean checkout and
+# CI behave alike, and nothing is written into the repository.
+_FUZZ = {"deadline": None, "database": None, "suppress_health_check": [HealthCheck.too_slow]}
+if deep := os.environ.get("WEFT_FUZZ_EXAMPLES"):
+    settings.register_profile("fuzz", max_examples=int(deep), **_FUZZ)
+else:
+    settings.register_profile("fuzz", max_examples=1000, derandomize=True, **_FUZZ)
+settings.load_profile("fuzz")
 
 
 @pytest.fixture(scope="session")
@@ -25,7 +39,7 @@ def chromium() -> None:
         with sync_playwright() as pw:
             pw.chromium.launch(headless=True).close()
     except Error as exc:
-        pytest.skip(f"headless Chromium is not available: {str(exc).splitlines()[0]}")
+        skip_or_fail(f"headless Chromium is not available: {str(exc).splitlines()[0]}")
 
 
 @pytest.fixture

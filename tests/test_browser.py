@@ -18,6 +18,7 @@ import httpcore
 import pytest
 
 from fixture_site import JS_SHELL_HTML, FixtureSite
+from skips import skip_or_fail
 from weft.config import Settings
 from weft.fetch.browser import BrowserPool, Rendered
 from weft.fetch.errors import FetchError
@@ -81,7 +82,7 @@ async def render(pool: BrowserPool, res: FetchResult) -> str:
         return (await pool.render(res)).html
     except FetchError as exc:
         if exc.code == "render_unavailable":
-            pytest.skip(f"headless Chromium is not installed: {exc}")
+            skip_or_fail(f"headless Chromium is not installed: {exc}")
         raise
 
 
@@ -296,7 +297,7 @@ async def render_result(pool: BrowserPool, res: FetchResult) -> Rendered:
         return await pool.render(res)
     except FetchError as exc:
         if exc.code == "render_unavailable":
-            pytest.skip(f"headless Chromium is not installed: {exc}")
+            skip_or_fail(f"headless Chromium is not installed: {exc}")
         raise
 
 

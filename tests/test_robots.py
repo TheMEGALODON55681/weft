@@ -144,6 +144,89 @@ def test_a_bad_crawl_delay_is_ignored(value: str) -> None:
     assert parse_robots(f"User-agent: *\nCrawl-delay: {value}").crawl_delay is None
 
 
+@pytest.mark.parametrize(
+    "sep", ["\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", chr(0x2028), chr(0x2029)]
+)
+def test_a_line_ends_at_cr_lf_or_crlf_and_nowhere_else(sep: str) -> None:
+    # str.splitlines() also breaks at these, which would cut the rule short and block "/a" whole.
+    assert allowed(f"User-agent: *\nDisallow: /a{sep}/b", "/a/x")
+    assert not allowed(f"User-agent: *\nDisallow: /a{sep}/b", f"/a{sep}/b")
+
+
+@pytest.mark.parametrize("eol", ["\n", "\r", "\r\n"])
+def test_all_three_line_endings_end_a_line(eol: str) -> None:
+    assert not allowed(f"User-agent: *{eol}Disallow: /x{eol}", "/x")
+    assert allowed(f"User-agent: *{eol}Disallow: /x{eol}Allow: /y", "/y")
+
+
+# --- percent-encoding, RFC 9309 section 2.2.2 -------------------------------------------------
+# Non-ASCII octets are percent-encoded on both sides, the hex digits are upper case, and an escape
+# of an unreserved character (letter, digit, - . _ ~) is decoded. An escape of a reserved
+# character stays an escape, so `%2F` is not a slash and `%2A` is not a wildcard.
+
+
+@pytest.mark.parametrize(
+    ("rule", "path"),
+    [
+        ("/foo/bar/ü", "/foo/bar/%C3%BC"),  # the RFC's own examples
+        ("/foo/bar/ツ", "/foo/bar/%E3%83%84"),
+        ("/foo/bar/%E3%83%84", "/foo/bar/%E3%83%84"),
+        ("/foo/bar/%62%61%7A", "/foo/bar/baz"),
+        ("/foo/bar/baz", "/foo/bar/%62%61%7A"),
+        ("/~user", "/%7Euser/page"),
+        ("/%7Euser", "/~user/page"),
+        ("/a%2Fb", "/a%2fb"),  # hex case does not matter
+        ("/a%2fb", "/a%2Fb"),
+        ("/caf%c3%a9", "/caf%C3%A9"),
+        ("/café", "/caf%c3%a9"),
+        ("/*%7E", "/x/~"),  # a wildcard rule is normalised around its `*`
+        ("/a%2Ab", "/a%2ab"),
+        ("/100%", "/100%"),  # a lone % is not an escape and is left as it is
+        ("/a%zzb", "/a%zzb"),
+        ("/%41%42", "/AB"),
+    ],
+)
+def test_escapes_are_normalised_before_matching(rule: str, path: str) -> None:
+    assert not allowed(f"User-agent: *\nDisallow: {rule}", path)
+
+
+@pytest.mark.parametrize(
+    ("rule", "path"),
+    [
+        ("/a%2Fb", "/a/b"),  # an encoded slash is not a slash
+        ("/a/b", "/a%2Fb"),
+        ("/a%2Ab", "/aXb"),  # an encoded * is not a wildcard
+        ("/a$", "/a%24"),  # an encoded $ is not an anchor, and not a match for the anchored rule
+        ("/a%24", "/a"),
+        ("/a%3Fb", "/a?b"),  # nor is an encoded ?
+        ("/%25", "/%"),
+        ("/%2541", "/%41"),  # one pass: %25 stays, it is not decoded twice
+        ("/%7Euser", "/%7Fuser"),
+    ],
+)
+def test_reserved_escapes_stay_escapes(rule: str, path: str) -> None:
+    assert allowed(f"User-agent: *\nDisallow: {rule}", path)
+
+
+def test_the_longest_rule_is_judged_on_its_normalised_length() -> None:
+    # "/a/%7E" is the four-octet rule "/a/~" once decoded, shorter than "/a/~/x".
+    robots = "User-agent: *\nDisallow: /a/%7E\nAllow: /a/~/x"
+    assert not allowed(robots, "/a/~/y")
+    assert allowed(robots, "/a/~/x")
+
+
+async def test_the_fetcher_applies_it_to_the_request_target(
+    make_site: Callable[..., FixtureSite], fetch_with: Callable[..., Fetcher]
+) -> None:
+    site = make_site(robots="User-agent: *\nDisallow: /café\nDisallow: /%7Eme")
+    fetcher = fetch_with()
+    for path in ("/caf%C3%A9/menu", "/caf%c3%a9", "/~me/page", "/%7eme"):
+        with pytest.raises(FetchError) as e:
+            await fetcher.fetch(site.url(path))
+        assert e.value.code == "robots_disallowed", path
+    assert (await fetcher.fetch(site.url("/cafe"))).status == 404
+
+
 # --- the cache -----------------------------------------------------------------------------
 
 

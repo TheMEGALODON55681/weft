@@ -9,8 +9,8 @@ Build order is fixed. Each phase is finished, tested and documented before the n
 | 3 | Rendering: Playwright pool, auto-escalation policy | Done |
 | 4 | Crawling: frontier, goal scoring, dedupe, `crawl_site`, `map_site`, jobs, resume | Done |
 | 5 | Retrieval: passage ranking, `search_in_site`, schema `extract`, optional rerank and model extraction | Done |
-| 6 | Remote: streamable HTTP transport, bearer auth, Docker, `/healthz` | Done, with the image unbuilt (see Phase 6) |
-| 7 | Hardening: load test, fuzzing, docs polish | Not started |
+| 6 | Remote: streamable HTTP transport, bearer auth, Docker, `/healthz` | Done. CI builds the image and runs the suite in it, and its first run is still to come (see Phases 6 and 7) |
+| 7 | Hardening: load test, fuzzing, HTTP/2 test, docs polish | Done |
 
 ## Phase 1: done
 
@@ -28,7 +28,7 @@ Gaps Phase 1 left, and what became of them:
 
 - Extraction had no timeout. Closed in Phase 2, with one ceiling: see below.
 - The README warned that there was no SSRF guard. Removed in Phase 2, once the guard and its tests were in.
-- HTTP/2 is configured but no test exercises it. Phase 2 added a TLS fixture, but it speaks HTTP/1.1 over TLS, so HTTP/2 still needs a server that negotiates `h2`. Still open, Phase 7.
+- HTTP/2 is configured but no test exercises it. Phase 2 added a TLS fixture, but it speaks HTTP/1.1 over TLS, so HTTP/2 still needs a server that negotiates `h2`. Closed in Phase 7.
 - `render="always"` returned `render_unavailable`. Closed in Phase 3.
 - The `jobs`, `frontier` and `pages` tables exist and nothing uses them. Closed in Phase 4, which migrated them to version 2.
 - Conditional requests and the TTL page cache. Closed in Phase 4.
@@ -49,11 +49,11 @@ Delivered:
 
 Left for later:
 
-- HTTP/2 through the guarded transport is untested. The TLS fixture exists but does not negotiate `h2`. Phase 7.
-- A page that hangs extraction frees the caller but not the thread. Running extraction in a child process that can be killed is the fix. Phase 7, if it shows up in load tests.
+- HTTP/2 through the guarded transport is untested. The TLS fixture exists but does not negotiate `h2`. Closed in Phase 7.
+- A page that hangs extraction frees the caller but not the thread. Running extraction in a child process that can be killed is the fix. Phase 7 found a page that did this (deep nesting) and capped that case. The rest is still open: see Phase 7.
 - Per-host state in the limiter and breaker is never evicted. Closed in Phase 4: an LRU that never drops a busy host.
-- Limits are per host name. Two names for one server are not merged. Phase 4 did not need it. Still open, Phase 7 if load tests show aliases matter.
-- robots.txt matching compares paths as sent, without percent-encoding normalisation. Rare in practice. Phase 7.
+- Limits are per host name. Two names for one server are not merged. Phase 4 did not need it, and the Phase 7 load tests did not look at it. Still open.
+- robots.txt matching compares paths as sent, without percent-encoding normalisation. Rare in practice. Closed in Phase 7.
 - The `Sitemap:` lines in robots.txt are ignored. Closed in Phase 4.
 - A wait longer than `total_timeout_s` is refused. Closed in Phase 4: crawl fetches get `crawl_fetch_timeout_s`, and the job has `crawl_timeout_s`.
 
@@ -97,9 +97,9 @@ Delivered:
 Left for later:
 
 - Relevance uses BM25 corpus statistics gathered during the crawl. A resumed job starts them again, so scores before and after a restart differ a little.
-- Near-duplicate detection compares against every kept page: linear in the size of the crawl. Fine for thousands of pages. Bucketing by bit bands is the upgrade.
+- Near-duplicate detection compares against every kept page: linear in the size of the crawl. Fine for thousands of pages. Bucketing by bit bands is the upgrade. The Phase 7 load test saw crawl throughput fall from 43 pages a second at 400 pages to 32 at 5,000 and did not profile why. This scan is one candidate.
 - The pattern-run cap stops long legitimate pagination after ten pages in a row. A crawl that needs page 50 of a listing has to seed it.
-- Jobs, frontier rows and cache rows are never deleted. Needs a retention setting. Phase 7.
+- Jobs, frontier rows and cache rows are never deleted. Needs a retention setting. Still open after Phase 7, which measured it: about 5 KB of database per crawled page.
 - The number of queued jobs is unbounded. Phase 6 needs a cap per caller before the server goes on a network. Still open after Phase 6, with a reason: see below.
 - The page cache is shared by all callers, which is safe only while Weft sends no cookies. Authenticated crawls must partition or skip it.
 - `Cache-Control: no-store` is not honoured by the page cache.
@@ -162,7 +162,7 @@ Delivered:
 
 What was not done, and why:
 
-- **The image was never built and the suite never ran in a container.** There is no Docker, Podman or Docker Desktop on the machine this phase was built on, and installing one was out of scope. What stands in for it: the Dockerfile's two `uv sync` steps ran in a scratch environment on Windows and installed the project as a wheel, the `HEALTHCHECK` command is run by a test against a real server, and tests pin each requirement of the file (non-root user, headless shell, locked install, no secret). None of that proves the Debian package step, the browser download or `--cap-drop ALL`. Build the image on a machine with Docker before relying on it. `docker build --target test -t weft-test . && docker run --rm weft-test` runs the suite there.
+- **The image was never built and the suite never ran in a container.** Phase 7 wrote the workflow that does both on Linux. It has not run yet. There is no Docker, Podman or Docker Desktop on the machine this phase was built on, and installing one was out of scope. What stands in for it: the Dockerfile's two `uv sync` steps ran in a scratch environment on Windows and installed the project as a wheel, the `HEALTHCHECK` command is run by a test against a real server, and tests pin each requirement of the file (non-root user, headless shell, locked install, no secret). None of that proves the Debian package step, the browser download or `--cap-drop ALL`. Build the image on a machine with Docker before relying on it. `docker build --target test -t weft-test . && docker run --rm weft-test` runs the suite there.
 - No hosted connector or third-party MCP client was tried. The HTTP side was exercised with a `fastmcp` client and with raw requests. The README's client steps follow the common configuration shape and have not been run.
 - Chromium and Linux behaviour of the whole suite is unverified beyond what ran on Windows.
 
@@ -176,4 +176,27 @@ Left for later:
 - Playwright starts Chromium with its sandbox off. The container is the boundary in the image.
 - The image names its base by tag, and Debian's packages are not pinned.
 - The loopback check trusts the name `localhost` without resolving it. A hosts file that maps it elsewhere would expose a tokenless server to that address.
-- Phase 7: HTTP/2 through the guarded transport, a load test, fuzzing, retention for jobs and cache rows, and the remaining carry-overs from Phases 2 to 5.
+- Phase 7 did the HTTP/2 test, the load test and fuzzing. Retention for jobs and cache rows, and the carry-overs from Phases 2 to 5 that Phase 7 does not name, stay open.
+
+## Phase 7: done
+
+Delivered:
+
+- A GitHub Actions workflow (`.github/workflows/ci.yml`) with three independent jobs on `ubuntu-latest`. `lint` runs `ruff check` (with GitHub annotations), `ruff format --check --diff`, `uv lock --check` and `mypy`. `test` installs headless Chromium and runs the whole suite. `docker` builds the `test` stage and runs the suite inside it, then builds the runtime image and checks that it exits with code 2 without a token, turns healthy with one, answers `401` on `/mcp` without a token, and stops on `SIGTERM` before Docker's kill. Both actions are pinned to a commit, no secret is used, the token is read-only, and a missing Chromium fails the run instead of skipping tests. `tests/test_ci.py` pins those properties. The workflow has not run: Docker is not installed on the build machine, and the first run is the push.
+- `starlette`, `uvicorn` and `mcp` are direct dependencies, with ranges inside `fastmcp`'s own, and `uv.lock` is refreshed. `sniffio` is a direct dependency too, for a reason the load test found (below). `hypothesis` is a dev dependency.
+- Fuzzing (`tests/test_fuzz.py`), with hypothesis, over URL canonicalisation, link extraction, page extraction, encoding recovery, robots.txt parsing and matching, sitemaps and the nesting cap. Each test states one property. The default run draws 1,000 examples per property (a tenth of that for the slow HTML ones) from a fixed seed. `WEFT_FUZZ_EXAMPLES=20000` draws that many from a random one. It found five defects, all fixed, each with a plain regression test. The sitemap parser took 12 seconds on 100 KB of `<url>` tags with no close and 26 seconds on 4,000 spaces inside `<loc>`, and it runs on the event loop. `http://xn--/` made `Fetcher.fetch` raise idna's own error, so a link or a redirect to it killed a crawl. `canonicalize` returned URLs whose hosts cannot be names (an empty label, a space, a control character). `decode_body` raised on a charset name with a NUL in it. And robots.txt lines were split at characters RFC 9309 does not name.
+- A cap on how deeply a document may nest (`extract/nesting.py`). The HTML parser's time is quadratic in depth: 0.1 s at 10,000 levels, 1.3 s at 20,000, and a 500 KB page of nested `<div>` took two minutes. The parser releases the GIL, so the event loop stayed free, but the extraction thread cannot be stopped and there are four. The cap cuts a document where more than 5,000 elements are open at once. See the first item under Left for later.
+- An HTTP/2 test through the guarded transport (`tests/test_http2.py`, with a server fixture in `tests/h2_site.py` that records the protocol each connection negotiated). It shows that `h2` is negotiated, that one connection carries robots.txt and the page, that `http2 = false` gives the same server HTTP/1.1, that the certificate is checked against the name, that the address guard refuses before any connection and on a redirect, that a body larger than the flow-control window arrives whole, that the byte cap cuts a stream and the connection survives, that gzip is decoded, that parallel fetches share connections, and that a reset stream is a `network_error` after which the next request works. Four mutants of the guard and the transport are caught.
+- robots.txt percent-encoding, per RFC 9309 section 2.2.2 (see Architecture), and line endings at CR, LF or CRLF.
+- Load tests (`tests/test_load.py`) against a generated site on the fixture server, 400 pages by default and `WEFT_LOAD_PAGES` for more. They run a burst of fetches through one Fetcher, a crawl of every page, and eight MCP clients at once over the HTTP transport with `/healthz` polled throughout. On the build machine (a Windows laptop), the 5,000-page crawl took 154 seconds (32 pages a second, against 43 at 400 pages), fetched every page once with no failure or duplicate, grew resident memory by 6 MB, used 27 MB of database and left no task behind. Few requests overlapped at the server (at most two in flight with 16 workers), so extraction and database work pace a crawl, not the network. A burst of 5,000 fetches ran at 152 a second. Eight clients making 24 fetches kept to the host's two slots, and every `/healthz` answer was a 200 within 350 ms.
+- The load test also found that httpcore imports `sniffio` inside a function that runs several times per request, and that a missing package is searched for again on every call. Fetches ran at 40 to 50 a second without it and 200 to 240 with it. A test checks that it is installed.
+- 843 tests, 158 more than Phase 6, and strict types and lint clean. 31 hand-made mutants of the Phase 7 code are all caught. Details are in BuildLog.
+
+Left for later:
+
+- Extraction still runs in threads that cannot be stopped. The nesting cap closes the case that was quadratic. It is a scan, not a parser, so a page written against it can still get past (the comment in `extract/nesting.py` says how). The complete answer is a child process that can be killed. Separately, extraction is linear but slow on big pages: about 4 microseconds a byte on plain paragraphs and about 100 microseconds a link on a link-dense page. A 2 MB page of paragraphs took 30 seconds and a 6 MB page of 200,000 links 96 seconds. A page that size outlasts `extract_timeout_s`, the caller gets `extraction_timeout`, and the thread finishes in the background.
+- Nothing deletes jobs, frontier rows or cache rows. Measured: about 5 KB of database per crawled page, 27 MB for 5,000. Needs a retention setting.
+- robots.txt matching checks every rule on every request. A file at the 500 KiB read limit (about 25,000 rules) costs 5 to 10 ms per check on the event loop. A real file is a few hundred rules.
+- The first CI run is still to come, and the Docker image has never been built. The `SIGTERM` branch of the child-process tests, the Debian package step and the browser download have run on no machine yet, and the suite has never run on Linux.
+- Crawl throughput fell from 43 to 32 pages a second between 400 and 5,000 pages. Where the time goes is not known.
+- Carry-overs from Phases 2 to 6 that this section does not name are unchanged: limits per host name, one token and no caller identity, no cap on queued jobs, the shared page cache, `Cache-Control: no-store`, sitemaps with namespace prefixes, `same_domain_only` and `www.`, two servers on one data directory, English-only stemming, and the rest of the lists above.

@@ -7,6 +7,7 @@ trailing slash, `www.`, and the encoding of reserved characters. Each of those c
 server returns.
 """
 
+import ipaddress
 import re
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -20,6 +21,7 @@ _PCT = re.compile(r"%([0-9A-Fa-f]{2})")
 # Characters kept as they are when quoting: reserved, unreserved and "%" itself.
 _SAFE = "!$&'()*+,;=:@/?-._~%"
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+_HOST = re.compile(r"[a-z0-9_-]+(\.[a-z0-9_-]+)*")  # letters, digits, "-" and "_", no empty label
 
 
 def _pct(text: str) -> str:
@@ -53,13 +55,24 @@ def _remove_dot_segments(path: str) -> str:
 
 
 def _host(raw: str) -> str:
+    """Lower case, no trailing dot, IDN as punycode. Raises ValueError for anything that cannot be
+    the name of a host: a label IDNA cannot encode, an empty label, a space, a control character or
+    a percent escape. Such a URL would be queued, refused by the fetcher and recorded as a failure,
+    for no gain. An IPv6 literal is checked as an address."""
     host = raw.lower().rstrip(".")
-    if host.isascii():
+    if ":" in host:
+        if "%" in host:
+            raise ValueError("a zone id in the host")
+        ipaddress.IPv6Address(host)  # AddressValueError is a ValueError
         return host
-    try:
-        return host.encode("idna").decode("ascii")
-    except UnicodeError:
-        return host
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError(f"not a usable host name: {raw!r}") from None
+    if not _HOST.fullmatch(host):
+        raise ValueError(f"not a usable host name: {raw!r}")
+    return host
 
 
 def _is_tracking(pair: str) -> bool:

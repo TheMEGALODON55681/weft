@@ -1,6 +1,6 @@
 # Architecture
 
-State as of Phase 6. Later phases add modules and tables; each phase updates this file.
+State as of Phase 7, the last planned phase. Each phase updated this file.
 
 ## Layout
 
@@ -25,6 +25,7 @@ src/weft/
   extract/decode.py   bytes to text for mislabelled or undeclared encodings
   extract/content.py  HTML to Markdown, title, metadata
   extract/links.py    outgoing links
+  extract/nesting.py  cap_nesting: cuts a document that nests too deep, before any HTML parser sees it
   extract/schema.py   Extractor: CSS and XPath rules written into a JSON Schema, validation, limits
   extract/llm.py      the model fallback: prompt, call, parse
   frontier/canon.py   URL canonicalisation, site keys, URL patterns for trap detection
@@ -44,6 +45,7 @@ tests/             unit tests per module, plus tests/fixture_site.py
 docs/
 Dockerfile         three stages: base, test, runtime (the default)
 .dockerignore      keeps the repository's local state and secrets out of the build context
+.github/workflows/ci.yml  three jobs on Linux: lint and types, the suite, and the image with the suite inside it
 uv.lock            every dependency pinned, including the transitive ones
 ```
 
@@ -56,7 +58,7 @@ uv.lock            every dependency pinned, including the transitive ones
 3. Every mode starts with a plain fetch. The browser never fetches the document itself.
 4. `Fetcher.fetch` validates the URL, then runs everything below under one `asyncio.timeout(total_timeout_s)`. Waits for a host's turn, retries, backoff sleeps, robots.txt reads and redirects all spend from that one budget. A caller can pass `timeout_s` to replace it for one call. Crawl jobs do, with `crawl_fetch_timeout_s`, so a long `Crawl-delay` is waited out instead of refused. Extra `headers` are sent on every hop, which is how the cache's validators travel.
 5. The redirect loop in `Fetcher._fetch` handles each hop the same way:
-   1. **robots.txt.** `RobotsCache.rules_for` returns the origin's cached rules, or reads `/robots.txt` on a miss. That read goes through steps b to e itself, with the robots check off and no spacing, so it gets the address guard, the breaker, the host's slots and retries. The hop is refused with `robots_disallowed` if the rules say so. The rules' `Crawl-delay` raises the spacing for this hop. The `/robots.txt` URL itself is never checked.
+   1. **robots.txt.** `RobotsCache.rules_for` returns the origin's cached rules, or reads `/robots.txt` on a miss. That read goes through steps b to e itself, with the robots check off and no spacing, so it gets the address guard, the breaker, the host's slots and retries. The hop is refused with `robots_disallowed` if the rules say so. A rule and the request target are compared after one normalisation of percent-encoding (RFC 9309 section 2.2.2: non-ASCII characters as UTF-8 escapes, upper-case hex, escapes of unreserved characters decoded, escapes of reserved characters kept), and a file's lines end at CR, LF or CRLF only. The rules' `Crawl-delay` raises the spacing for this hop. The `/robots.txt` URL itself is never checked.
    2. **Breaker, first look.** `CircuitBreaker.peek` refuses at once if the host's breaker is open, so a caller does not queue for a host that is down.
    3. **Limits.** `HostLimiter.slot` takes one of the host's concurrency slots, reserves the next start time (refusing with `rate_limited` if the wait would exceed `total_timeout_s`), sleeps until then, and takes a global slot. A host that is being made to wait never holds global slots.
    4. **Breaker, second look.** `CircuitBreaker.check` runs inside the slot, just before sending. The breaker may have opened while the request waited, and this is where the single probe after a cooldown is admitted.
@@ -64,10 +66,10 @@ uv.lock            every dependency pinned, including the transitive ones
    6. **Outcome.** A transport failure, or a `429`, `502`, `503` or `504`, is recorded as a failure against the host. If retries remain, the loop sleeps for the backoff (or the `Retry-After`, if it fits in the remaining budget) outside the slot and goes back to step b. When retries run out, a transport failure is raised and an overloaded response is returned as a result. Any other response is recorded as a success.
    7. **Redirect.** A 3xx with a `Location` is validated (http or https, a host, no credentials, not a URL already visited, within `max_redirects`) and the loop starts again at step a for the new URL.
 6. `get_page` refuses non-HTML content types with `unsupported_content_type`, unless the status is 400 or above: an error page is returned as a result with empty Markdown, whatever its type. An absent `Content-Type` counts as HTML.
-7. Decoding and extraction run in a worker thread so the event loop stays free, under `extract_timeout_s`. The thread comes from a pool of four that belongs to extraction alone. A thread cannot be interrupted, so a timeout frees the caller with `extraction_timeout` and leaves the thread to finish. The separate pool keeps stuck pages from using up the default executor, which also runs DNS lookups. `decode_body` tries a byte-order mark, the header charset, a `<meta>` charset, UTF-8, statistical detection and, as a last resort, UTF-8 with replacement characters. It never raises.
+7. Decoding and extraction run in a worker thread so the event loop stays free, under `extract_timeout_s`. The decoded HTML first goes through `cap_nesting` (see Nesting cap). The thread comes from a pool of four that belongs to extraction alone. A thread cannot be interrupted, so a timeout frees the caller with `extraction_timeout` and leaves the thread to finish. The separate pool keeps stuck pages from using up the default executor, which also runs DNS lookups. `decode_body` tries a byte-order mark, the header charset, a `<meta>` charset, UTF-8, statistical detection and, as a last resort, UTF-8 with replacement characters. It never raises.
 8. `extract_page` runs trafilatura for Markdown and metadata, and selectolax for links, `<title>`, `lang` and the canonical URL. A parser crash is logged and yields empty Markdown, not an exception.
 9. **Render policy.** With `render="never"`, or `"auto"` when `wants_render` says no, the HTTP extraction is the answer. `wants_render` runs in the same worker thread. It says yes only if the page has a `<script>` and either the extracted text is under `render_min_words` words or a `<noscript>` mentions JavaScript. A page without scripts cannot gain content from a browser. With `render="always"`, the HTTP extraction is skipped.
-10. **Rendering.** `BrowserPool.render` loads the fetched body in Chromium (see Rendering) and returns the serialised DOM and the page's final URL. That HTML goes through `extract_page` in the same pool and under the same timeout. In `"auto"` mode, any render failure is logged as `render skipped` and the HTTP extraction is returned. In `"always"` mode it is raised.
+10. **Rendering.** `BrowserPool.render` loads the fetched body in Chromium (see Rendering) and returns the serialised DOM and the page's final URL. That HTML goes through `extract_page` in the same pool and under the same timeout. It needs no nesting cap (see Nesting cap). In `"auto"` mode, any render failure is logged as `render skipped` and the HTTP extraction is returned. In `"always"` mode it is raised.
 11. `get_page` applies `max_content_chars` and `max_links`, records the totals, and returns a `PageResult`. `fetch_method` says which path produced the content. `elapsed_ms` covers the whole call.
 12. `server/app.py` converts any `FetchError` into an MCP tool error whose message starts with the error code. Anything else is logged with a traceback and reaches the client as a generic failure, with details masked.
 
@@ -88,7 +90,7 @@ uv.lock            every dependency pinned, including the transitive ones
    - The SHA-256 of the Markdown's words matches a kept page: `duplicate`.
    - With at least 30 words, a simhash within 6 bits of a kept page: `duplicate`.
    - Otherwise `done`. Its relevance is BM25 of title plus Markdown against the goal, `s / (s + 2)`. The page joins the corpus statistics first.
-8. **Expand.** A `done` page under `max_depth` adds its links. Each is canonicalised and dropped if it is `nofollow`, out of scope (another site with `same_domain_only`, failing the include or exclude globs, longer than 2048 characters, repeating a path segment more than twice), more than ten in a row with its parent's URL pattern, or disallowed by robots.txt rules that are already cached. Its score is `0.45 * anchor overlap + 0.25 * URL overlap + 0.30 * parent relevance`, where overlap is the share of goal terms present. With no goal, the score is `1 / (1 + depth)`, which makes the crawl breadth-first. Links already known keep their row. A pending one takes the higher score, the smaller depth and the shorter pattern run.
+8. **Expand.** A `done` page under `max_depth` adds its links. Each is canonicalised (a URL whose host cannot be a name, such as one with an empty label, a space or a percent escape, is refused there) and dropped if it is `nofollow`, out of scope (another site with `same_domain_only`, failing the include or exclude globs, longer than 2048 characters, repeating a path segment more than twice), more than ten in a row with its parent's URL pattern, or disallowed by robots.txt rules that are already cached. Its score is `0.45 * anchor overlap + 0.25 * URL overlap + 0.30 * parent relevance`, where overlap is the share of goal terms present. With no goal, the score is `1 / (1 + depth)`, which makes the crawl breadth-first. Links already known keep their row. A pending one takes the higher score, the smaller depth and the shorter pattern run.
 9. After each page the job's `run_s` and `updated_at` are written.
 10. The crawl ends when the workers stop (`exhausted` or `max_pages`) or the budget runs out (`time_budget`). Rows still `fetching` go back to `pending`, and the task marks the job `done` with the reason, but only if it is still `running`, so a cancel is never overwritten.
 
@@ -98,7 +100,7 @@ uv.lock            every dependency pinned, including the transitive ones
 
 1. `get_page` fetches the start page with `render="never"`. Its failure is the tool's failure.
 2. The start origin's robots.txt is read through the Fetcher. Its `Sitemap:` lines are the queue, resolved against the site root if relative. With none, the queue is `/sitemap.xml`.
-3. Up to 20 files are fetched through the Fetcher. A body starting with the gzip magic bytes is unpacked to at most `max_body_bytes`. `<loc>` and `<lastmod>` are read by pattern, never by an XML parser, so there are no entities to expand. A `<sitemapindex>` adds its children to the queue.
+3. Up to 20 files are fetched through the Fetcher. A body starting with the gzip magic bytes is unpacked to at most `max_body_bytes`. `<url>`, `<sitemap>`, `<loc>` and `<lastmod>` are found by scanning for the tags with `find`, never by an XML parser, so there are no entities to expand, and the scan is linear in the size of the file. A `<sitemapindex>` adds its children to the queue.
 4. URLs are canonicalised, kept only on the start page's site, and deduplicated. The start page and its links go in first. A URL seen first as a link takes the sitemap's `lastmod`. `allowed` comes from that URL's own origin's robots rules if they are cached, and is `null` otherwise. Reading stops at `max_urls`.
 
 ## Data flow: `search_in_site`
@@ -138,6 +140,18 @@ The token is not in the image. Because the image binds `0.0.0.0`, a container st
 
 The installed copy of Weft is a wheel in the virtual environment, so the `test` stage tests what the `runtime` stage runs, not the source tree.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` has three jobs on `ubuntu-latest` that do not depend on each other, so one red job hides no other. Each ends with a step that, on failure, writes the commands that reproduce it to the job summary.
+
+- `lint`: `uv sync --frozen --extra dev`, `uv lock --check`, `ruff check --output-format=github` (annotations on the diff), `ruff format --check --diff`, and `mypy`.
+- `test`: the same sync, `playwright install --with-deps chromium-headless-shell`, then `pytest -ra --tb=short`. `CI=true` is set, and `tests/skips.py` turns a missing Chromium from a skip into a failure, so a broken browser install cannot pass as a green run.
+- `docker`: builds the `test` stage and runs the suite in it (`--init`, `CI=true`), builds the runtime image, and checks three things only a container shows. Without a token it exits with code 2. With a random one, started with the README's flags (`--init`, `--cap-drop ALL`, `--security-opt no-new-privileges`, `--memory 2g`, a named volume for `/data`), it turns healthy on `/healthz` and answers `401` to `POST /mcp` without a token. Then `docker stop --time 15` must end it with an exit code other than 137, which would mean it was killed after the grace period instead of stopping on `SIGTERM`. The container's log is printed when a step fails, and the container is removed either way.
+
+The two actions (`actions/checkout`, `astral-sh/setup-uv`) are pinned to commits with their release in a comment. uv is pinned to the version that wrote `uv.lock` and that the Dockerfile installs. No secret is used, the token is `contents: read`, the checkout keeps no credentials, and a newer push to the same ref cancels the older run. `tests/test_ci.py` reads the file as text and fails if an action is unpinned, a secret or a write permission appears, a job is missing or a command is dropped. The workflow had not run when this was written.
+
+In the image's `test` stage, `tests/` holds the tests and the package is installed, but the repository's `Dockerfile` and `.github` are not there, so `test_docker.py` and `test_ci.py` skip themselves.
+
 ## Error model
 
 `FetchError(code, message)` is the one expected failure type. Codes are stable strings listed in the README. HTTP error statuses are not errors: a 404 page, or a 503 that outlasted the retries, comes back as a normal result with its status, whatever its content type. A crawl records them as failures with the code `http_<status>`.
@@ -146,7 +160,7 @@ Which layer raises each code, and what the retry loop and breaker do with it:
 
 | Code | Raised by | Retried | Counts against the breaker |
 | --- | --- | --- | --- |
-| `invalid_url`, `redirect_loop`, `too_many_redirects` | `fetch/http.py` | no | no |
+| `invalid_url`, `redirect_loop`, `too_many_redirects` | `fetch/http.py` (`invalid_url` also for a host name IDNA cannot decode, such as `xn--`, whether in the URL given or in a redirect) | no | no |
 | `blocked_address` | `fetch/ssrf.py`, at connect | no | no |
 | `network_error` for a name that does not resolve | `fetch/ssrf.py`, at connect | no | no |
 | `network_error`, `timeout` from the transport | `fetch/http.py`, from httpx errors | yes | yes |
@@ -190,6 +204,16 @@ A Playwright error (a crashed tab, a heap that ran out) becomes `render_failed`.
 **The proxies.** The pool keeps one browser-wide `GuardedProxy`, started with the first browser, because Chromium on Windows needs a browser-wide proxy before per-context proxies work. Every context overrides it, so it only sees traffic that belongs to no context. Each render's own proxy is the same class with two extras. Its byte budget counts bytes relayed from upstream. Once spent, every relay stops at its next chunk and new connections get a 403. Its pacing reserves a start time per host name, with the limiter's `reserve`, before each upstream connect. A wait longer than `read_timeout_s` is refused with a 503. Plain HTTP through the proxy is one request per connection, so for `http://` pacing is per request. An HTTPS tunnel can carry many requests, so for `https://` it is per connection. Closing a proxy never waits on idle clients. It sets a flag that any handler not yet started checks first, cancels the rest, and bounds Python 3.12's `Server.wait_closed()` at one second, because a socket Chromium opened ahead of need would otherwise hold it until the render timed out.
 
 `GuardedProxy` speaks the part of HTTP/1.1 that Chromium uses with a proxy. `CONNECT host:port` (HTTPS and WebSockets) opens an upstream through `GuardedBackend.connect_tcp`, the same code that guards plain HTTP, answers 200 and copies bytes both ways. An absolute-form request (plain `http://`) is rewritten to origin form, with `Host` taken from the URL, hop-by-hop headers dropped and `Connection: close` added, and only the request's own `Content-Length` body is forwarded. A request with `Transfer-Encoding` gets 411, because the proxy cannot tell where it would end. Anything else the client sends on that connection is read and dropped, so a second request can never reuse an upstream checked for another host. A blocked address answers 403 with the same message as plain HTTP, which does not say where the name points. A name that does not resolve answers 502, and a connect timeout 504. Heads over 64 KiB and malformed requests get 400. A tunnel ends when either side closes or goes quiet for `read_timeout_s`. Closing the proxy ends every open tunnel.
+
+## Nesting cap
+
+`extract/nesting.py`. lexbor, the parser behind selectolax, takes time quadratic in how deep a document nests: 0.1 s at 10,000 levels, 1.3 s at 20,000, about 30 s at 100,000, and Weft parses a page three times (links and title, the extractor, the render check). The parser releases the GIL, so the event loop stays free, but the thread cannot be stopped. A 500 KB page of nested `<div>` held one of the four extraction threads for two minutes.
+
+`cap_nesting(html)` runs before the parsers, on the decoded HTML of a plain fetch. The DOM Chromium returns does not need it: the headless shell cannot serialise a DOM nested more than a few hundred levels (the tab crashes, between 100 and 300 levels on the build machine), so a script that nests deeper fails the render with `render_failed` and the pool carries on, which a test checks.
+
+The cap finds tags with one regular expression that stops at the next `<`, so it is linear even on a document full of tags that never end. It counts each start tag and takes one off for each end tag whose name it has counted, so a stray end tag cannot get it ahead of the opens. Void elements, elements whose end tag is optional and the document's own `html`, `head` and `body` are not counted, and neither are SVG shapes written with `/>`. When more than `MAX_NESTING` (5,000) elements are open at once, it returns the document up to that tag. Browsers stop at 512. The returned HTML is also what the cache stores and what `extract` reads.
+
+It is a scan, not a parser. It does not know what the real parser does with misnested tags, so it never needs to, and it cannot be fooled by a stray end tag. It can be fooled by a page written against it: end tags hidden in a comment, which it reads as end tags, or `<path/>` outside an SVG, which the parser opens and the scan does not. The cap stops pages that nest by accident or in the obvious way. The complete answer is extraction in a child process that can be killed.
 
 ## Storage
 
@@ -260,18 +284,17 @@ In place:
 - **Extraction rules.** The schema is the agent's input and the page is a stranger's, so both are bounded. The schema is limited in size, properties, depth, selector length and JSON nesting, and checked before any fetch. A `$ref` may point only inside the schema, which `jsonschema` would not fetch anyway but nothing should rely on that. Selectors run on an lxml tree from the HTML parser, which loads no external entities and no network resource. XPath 1.0 has no function that opens a file or a URL. A run collects at most `max_content_chars` characters, because a selector such as `div` on nested divs returns the same text at every level, and a page can build that for a few kilobytes. Validation errors are capped at ten of 300 characters.
 - **Providers.** The endpoints come from settings and no tool argument can name one. The key is a `SecretStr`, sent only in the `Authorization` header. Redirects are not followed, since one would carry the key to wherever it points. A call has a wall-clock limit, because the HTTP client's timeouts apply per read and a server that drips bytes would never trip them. An error carries a code and a short message that never holds the key or the response body. The model is told that the page is data and to ignore instructions in it, and its reply is trusted no further than its validity against the schema.
 
-How the guard reaches the client: httpx has no public hook for how connections are opened, so `guarded_transport` replaces the network backend on the transport's connection pool, through a private attribute. If an httpx upgrade moves it, the guard fails closed, because the SSRF tests expect refusals and would fail. A dependency bump should run them.
+How the guard reaches the client: httpx has no public hook for how connections are opened, so `guarded_transport` replaces the network backend on the transport's connection pool, through a private attribute. If an httpx upgrade moves it, the guard fails closed, because the SSRF tests expect refusals and would fail. A dependency bump should run them. The same guarded backend carries HTTP/2: `tests/test_http2.py` shows that `h2` is negotiated through it, with the certificate checked against the name and every refusal intact.
 
 `httpcore` is pinned to the 1.0 series in `pyproject.toml` because the guard depends on its private `_network_backend`. Raising that pin means re-running `tests/test_ssrf.py` first.
 
 Known ceilings:
 
 - Limits are per host name. `example.com`, `example.com.` and a second name for the same server are separate hosts. The limiter and the breaker keep state for `max_tracked_hosts` hosts and drop the least recently used idle one. A host that is mid-request, owed spacing or has an open breaker is kept even past the cap. The robots cache holds 512 origins and drops the least recently used.
-- robots.txt paths are compared as sent, without percent-encoding normalisation. Matching is plain string search, not regular expressions, because the file is controlled by the site.
+- robots.txt matching is plain string search, not regular expressions, because the file is controlled by the site. Every rule is checked on every request, so a file at the 500 KiB read limit (about 25,000 rules) costs 5 to 10 ms per check on the event loop, and a crawl checks each link of each page. A real file has a few hundred rules.
 - A hostname that resolves to several addresses is tried one address at a time, in resolver order, with no happy-eyeballs race.
 - On Windows a numeric spelling such as `2130706433` fails to resolve at all, after about three seconds, so the error is `network_error` there and `blocked_address` on Linux and macOS. Nothing connects either way.
-- HTTP/2 through the guarded transport has no test. The fixture can serve HTTPS, but it speaks HTTP/1.1 over it.
-- A page that hangs extraction occupies one of four threads until it finishes. Four of them stop extraction.
+- A page that hangs extraction occupies one of four threads until it finishes. Four of them stop extraction. The nesting cap (below) closes the case that was quadratic and found by fuzzing. It does not close the class. Extraction is also slow on big pages, in proportion to their size: about 4 microseconds a byte of plain paragraphs and about 100 microseconds a link on a link-dense page, so a 2 MB page of paragraphs took 30 seconds and a 6 MB page of 200,000 links 96 seconds. Either outlasts `extract_timeout_s`. The caller gets `extraction_timeout` and the thread finishes in the background. A child process that can be killed is the complete answer.
 - robots.txt, host pacing and the breaker apply to the browser's navigations, not to its sub-resources. Sub-resources get the address check, `render_max_bytes` and `render_host_interval_s` spacing per host. Over HTTPS the spacing is per tunnel, and one tunnel can carry many requests.
 - The proxies listen on loopback ports without authentication. A per-render proxy lives only for its render, and the browser-wide one lives as long as the browser. Another local process could use either, but only to reach addresses the guard allows. In the Docker image the only other processes in the network namespace are Weft and Chromium, and a published port forwards to the container's own address, not its loopback. That reasoning is not a test, since no container could run during Phase 6.
 - `browser_js_heap_mb` caps JavaScript memory per tab, not DOM, image or GPU memory. The byte budget caps what a render downloads, not what it allocates.
@@ -332,3 +355,15 @@ Phase 6 adds `tests/test_http.py`, `tests/test_docker.py` and cases in `test_con
 `test_docker.py` reads the Dockerfile. It runs the `HEALTHCHECK` command from the file, with the test's interpreter, against a healthy server, a server that answers 503 and a closed port, with a proxy variable set that the probe must ignore. It then checks as text what the file exists for: an unprivileged `USER` in the runtime stage, `runtime` as the last stage, the headless shell installed with its libraries, `--frozen` on every `uv sync`, a pinned uv, no token or secret in the image, and the repository's local state listed in `.dockerignore`. Nothing builds an image.
 
 `test_config.py` covers the loopback table (what counts and what does not), the refusal beyond loopback, empty and weak tokens (the error text never holds the value), trimming, the environment and the port range. `test_cli.py` swaps the server for a recorder and checks which call each flag and variable produces, exit code 2 for a bad token or a non-loopback bind without one, and that nothing starts in those cases. `test_logging.py` checks that the HTTP stack's loggers write the same JSON and that `color_message` is dropped. `test_server.py` sends error pages (400, 404 and 500) to a fake model and checks that it is never called.
+
+Phase 7 adds `tests/test_fuzz.py`, `tests/test_http2.py`, `tests/test_load.py`, `tests/test_nesting.py` and `tests/test_ci.py`, and cases in `test_robots.py`, `test_sitemap.py`, `test_canon.py`, `test_fetch_http.py` and `test_decode.py`.
+
+`test_fuzz.py` uses hypothesis. `conftest.py` registers one profile: 1,000 examples per property from a fixed seed (the HTML tests take a tenth of that), no deadline, and no example database, so a clean checkout and CI behave alike and nothing is written into the repository. `WEFT_FUZZ_EXAMPLES=N` switches to N examples from a random seed. The properties: `canonicalize` either raises `ValueError` or returns an ASCII URL with no fragment, credentials or control characters, a name or an address for a host, and a form that canonicalises to itself, and two spellings of one URL (other case, default port, trailing dot, dot segments, escaped letters in either hex case, shuffled and tracking parameters, a fragment) share one form; `parse_http_url` raises only `FetchError`; extracted links are http(s) URLs without a fragment that canonicalise or raise `ValueError`; `extract_page`, `decode_body`, `wants_render` and the extraction rules never raise on tag soup, bytes and odd charset names; `parse_robots` and `Rules.allows` never raise, the matcher agrees with a regular expression on small alphabets, the verdict is the longest match with `Allow` winning a tie, a rule always blocks the path it was written as, and an escaped unreserved character means the character; `parse_sitemap` never raises and runs in linear time on any tag or run of spaces repeated tens of thousands of times; `_gunzip` never exceeds its cap; `cap_nesting` returns a prefix, is stable and is linear. A table of known hostile pages (200,000 nested divs, 8,000 nested tables, tags that never end, a 1 MB attribute, 50,000 comment openers) must extract in under ten seconds.
+
+`tests/h2_site.py` is an HTTP/2 server on its own thread, built on the `h2` library that httpx needs: TLS with ALPN, flow control, a stream it resets on request, and an HTTP/1.1 answer on the same port for a client that offers nothing else. It records the ALPN protocol of every connection and every request, so `test_http2.py` can say which protocol was negotiated and how many connections carried how many requests. It shares `tests/certs.py` with `test_tls.py`.
+
+`test_load.py` runs against `/load/<i>` on the fixture, a generated tree of up to `WEFT_LOAD_PAGES` pages (5 links each, unique text, 2 ms per request, in-flight peak recorded). The burst, the crawl and the eight MCP clients are described in Phases. `tests/rss.py` reads resident memory on Windows and Linux. The thresholds are loose: a leak, a stall or a broken cap fails them, a slow day does not.
+
+`test_nesting.py` tests `cap_nesting` as a table of documents that must pass unchanged and documents that must be cut, an exact cut for plain divs, a hostile page extracted in under five seconds, linear time on tags that never end, and a nested page through `get_page` and the fixture's `/deep` route.
+
+`tests/http_app.py` holds `serve` and `remote`, which `test_http.py`, `test_docker.py` and `test_load.py` share. `tests/skips.py` is `skip_or_fail`, which fails in place of skipping when `CI` is set.

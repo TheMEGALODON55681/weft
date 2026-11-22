@@ -81,6 +81,23 @@ def path(site: FixtureSite, url: str) -> str:
 # --- ordering -------------------------------------------------------------------------------
 
 
+async def test_a_link_to_a_host_idna_rejects_fails_its_own_row_and_not_the_job(
+    make_site, env
+) -> None:
+    site: FixtureSite = make_site()
+    e = await env()
+    r = await e.crawl(
+        seed_urls=[site.url("/site/odd-hosts")], same_domain_only=False, max_pages=5, max_depth=1
+    )
+    rows = await e.rows(r.job.id)
+    assert r.job.status == "done"
+    assert (rows["http://xn--/a"]["state"], rows["http://xn--/a"]["error"]) == (
+        "failed",
+        "invalid_url",
+    )
+    assert rows[site.url("/site/about")]["state"] == "done"
+
+
 async def test_the_goal_is_crawled_first(make_site, env) -> None:
     site: FixtureSite = make_site()
     e = await env(crawl_concurrency=1)

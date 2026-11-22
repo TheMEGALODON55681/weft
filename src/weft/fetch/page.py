@@ -18,6 +18,7 @@ from selectolax.lexbor import LexborHTMLParser
 from weft.config import Settings
 from weft.extract.content import Extracted, extract_page
 from weft.extract.decode import decode_body
+from weft.extract.nesting import cap_nesting
 from weft.fetch.browser import BrowserPool
 from weft.fetch.cache import CacheEntry, PageCache
 from weft.fetch.errors import FetchError
@@ -50,7 +51,7 @@ def wants_render(html: str, markdown: str, min_words: int) -> bool:
 
 
 def _read_http(res: FetchResult, min_words: int) -> tuple[str, Extracted, bool]:
-    html = decode_body(res.body, res.charset)
+    html = cap_nesting(decode_body(res.body, res.charset))
     page = extract_page(html, res.final_url)
     return html, page, wants_render(html, page.markdown, min_words)
 

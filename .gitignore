@@ -17,3 +17,6 @@ htmlcov/
 *.db-shm
 weft.toml
 .env
+
+# hypothesis keeps its example database here when it is not turned off
+.hypothesis/

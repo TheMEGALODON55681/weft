@@ -6,6 +6,7 @@ The stdlib parser is not used. It matches rules in file order, not by length, an
 
 import asyncio
 import math
+import re
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -21,6 +22,27 @@ _UNREACHABLE_TTL_S = 60.0
 MAX_SITEMAP_LINES = 50
 
 Fetch = Callable[[str], Awaitable[tuple[int, bytes]]]
+
+# RFC 9309: a line ends at CR, LF or CRLF. str.splitlines() also breaks at \x0b, \x0c, \x1c to
+# \x1e, \x85 and the Unicode line and paragraph separators, which would cut a rule short.
+_LINE_END = re.compile(r"\r\n|\r|\n")
+_UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+# An escape, or a character outside ASCII. A `%` not followed by two hex digits is no escape.
+_ESCAPE_OR_NON_ASCII = re.compile(r"%([0-9A-Fa-f]{2})|[^\x00-\x7f]")
+
+
+def _normalise_one(m: re.Match[str]) -> str:
+    if m[1] is None:
+        return "".join(f"%{b:02X}" for b in m[0].encode("utf-8", "surrogatepass"))
+    return ch if (ch := chr(int(m[1], 16))) in _UNRESERVED else m[0].upper()
+
+
+def normalise(text: str) -> str:
+    """RFC 9309 section 2.2.2: one spelling for a rule and for a request path, so the two compare.
+    Non-ASCII characters become UTF-8 escapes, hex digits are upper case, and an escape of an
+    unreserved character is decoded. An escape of a reserved character stays one: `%2F` is not a
+    slash and `%2A` is not a wildcard. Each escape is read once, so `%2541` stays `%2541`."""
+    return _ESCAPE_OR_NON_ASCII.sub(_normalise_one, text)
 
 
 def _matches(pattern: str, path: str) -> bool:
@@ -53,6 +75,7 @@ class Rules:
     def allows(self, path: str) -> bool:
         """`path` is the request target: path plus query. The longest matching rule wins and
         Allow wins a tie. No match means allowed."""
+        path = normalise(path)
         verdict, best = True, -1
         for allow, pattern in self.rules:
             n = len(pattern)
@@ -81,7 +104,7 @@ def parse_robots(text: str) -> Rules:
     groups: list[_Group] = []
     sitemaps: list[str] = []
     reading_agents = False
-    for line in text.lstrip("﻿").splitlines():
+    for line in _LINE_END.split(text.lstrip("\N{BYTE ORDER MARK}")):
         name, colon, value = line.split("#", 1)[0].partition(":")
         if not colon:
             continue
@@ -100,7 +123,7 @@ def parse_robots(text: str) -> Rules:
             if name == "crawl-delay":
                 group.delay = group.delay if group.delay is not None else _delay(value)
             elif value:  # an empty Allow or Disallow says nothing
-                group.rules.append((name == "allow", value))
+                group.rules.append((name == "allow", normalise(value)))
     named = [g for g in groups if ROBOTS_AGENT in g.agents]
     mine = named or [g for g in groups if "*" in g.agents]
     return Rules(

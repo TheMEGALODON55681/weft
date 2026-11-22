@@ -4,14 +4,15 @@ Sitemaps come from the `Sitemap:` lines of robots.txt, or `/sitemap.xml` when th
 Sitemap indexes are followed, gzip files are unpacked, and every file is fetched through the
 Fetcher, so robots.txt, pacing and the address guard apply to each one.
 
-The XML is read with a pattern match for `<loc>` and `<lastmod>`, not an XML parser. A sitemap is
-untrusted input, and this way there are no entities to expand and no parser to attack. Sitemaps
-that use a namespace prefix on their tags (`<s:loc>`) are not read.
+The XML is read by scanning for the tags `<url>`, `<sitemap>`, `<loc>` and `<lastmod>`, not with an
+XML parser. A sitemap is untrusted input, and this way there are no entities to expand and no
+parser to attack. The scan is linear in the size of the file. Sitemaps that use a namespace prefix
+on their tags (`<s:loc>`) are not read.
 """
 
 import html
-import re
 import zlib
+from collections.abc import Iterator
 from typing import Literal
 
 import httpx
@@ -25,10 +26,38 @@ from weft.frontier.canon import canonicalize, site_key
 from weft.models import SiteMap, SiteMapEntry, SitemapRead
 
 MAX_SITEMAPS = 20  # files read per call, indexes included
-_URL_BLOCK = re.compile(rb"<url>(.*?)</url>", re.S)
-_SITEMAP_BLOCK = re.compile(rb"<sitemap>(.*?)</sitemap>", re.S)
-_LOC = re.compile(rb"<loc>\s*([^<]*?)\s*</loc>")
-_LASTMOD = re.compile(rb"<lastmod>\s*([^<]*?)\s*</lastmod>")
+
+
+def _blocks(body: bytes, tag: bytes) -> Iterator[bytes]:
+    """What lies between each `<tag>` and the next `</tag>`. Found by scanning forward with
+    `find`, because the patterns this replaced were quadratic on a file full of `<url>` with no
+    close (12 s for 100 KB) and cubic on a long run of spaces inside `<loc>`. This runs on the
+    event loop, so a hostile file must cost time in proportion to its size."""
+    opening, closing = b"<" + tag + b">", b"</" + tag + b">"
+    pos = 0
+    while (start := body.find(opening, pos)) >= 0:
+        start += len(opening)
+        end = body.find(closing, start)
+        if end < 0:  # no close ahead of this open means none ahead of any later open either
+            return
+        yield body[start:end]
+        pos = end + len(closing)
+
+
+def _field(block: bytes, tag: bytes) -> bytes | None:
+    """The text of the first `<tag>text</tag>` in `block` whose text holds no markup, trimmed.
+    Every scan stops at the next `<`, and `<tag>` begins with one, so the scans never overlap."""
+    opening, closing = b"<" + tag + b">", b"</" + tag + b">"
+    pos = 0
+    while (start := block.find(opening, pos)) >= 0:
+        start += len(opening)
+        lt = block.find(b"<", start)
+        if lt < 0:
+            return None
+        if block.startswith(closing, lt):
+            return block[start:lt].strip()
+        pos = start
+    return None
 
 
 def _gunzip(body: bytes, limit: int) -> bytes:
@@ -46,18 +75,11 @@ def _text(raw: bytes | None) -> str | None:
 
 def parse_sitemap(body: bytes) -> tuple[list[str], list[tuple[str, str | None]]]:
     """(child sitemaps, (url, lastmod) entries). A file that is neither comes back empty."""
-    children = [
-        loc
-        for block in _SITEMAP_BLOCK.findall(body)
-        if (m := _LOC.search(block)) and (loc := _text(m.group(1)))
-    ]
+    children = [loc for block in _blocks(body, b"sitemap") if (loc := _text(_field(block, b"loc")))]
     entries = []
-    for block in _URL_BLOCK.findall(body):
-        m = _LOC.search(block)
-        if m is None or not (url := _text(m.group(1))):
-            continue
-        mod = _LASTMOD.search(block)
-        entries.append((url, _text(mod.group(1)) if mod else None))
+    for block in _blocks(body, b"url"):
+        if url := _text(_field(block, b"loc")):
+            entries.append((url, _text(_field(block, b"lastmod"))))
     return children, entries
 
 

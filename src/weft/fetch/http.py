@@ -54,11 +54,12 @@ def parse_http_url(raw: str) -> httpx.URL:
         raise FetchError("invalid_url", "URL is empty or too long")
     try:
         url = httpx.URL(raw)
-    except httpx.InvalidURL as exc:
+        host = url.host  # decodes the host, and raises idna's own error for `xn--` and the like
+    except (httpx.InvalidURL, ValueError) as exc:
         raise FetchError("invalid_url", f"malformed URL: {exc}") from None
     if url.scheme not in ("http", "https"):
         raise FetchError("invalid_url", f"unsupported scheme {url.scheme!r}; use http or https")
-    if not url.host:
+    if not host:
         raise FetchError("invalid_url", "URL has no host")
     if url.userinfo:
         raise FetchError("invalid_url", "credentials in the URL are not accepted")
@@ -68,6 +69,10 @@ def parse_http_url(raw: str) -> httpx.URL:
 def _as_fetch_error(exc: Exception) -> FetchError:
     if isinstance(exc, TimeoutError | httpx.TimeoutException):
         return FetchError("timeout", "request timed out")
+    if isinstance(exc, UnicodeError):
+        # httpx decodes the host of a redirect target while it builds the next request, even with
+        # redirects off, and idna's errors are UnicodeErrors. `Location: http://xn--/` ends here.
+        return FetchError("invalid_url", f"malformed URL: {exc}")
     return FetchError("network_error", f"{type(exc).__name__}: {exc}")
 
 
@@ -130,7 +135,7 @@ class Fetcher:
                 result = await self._fetch(
                     raw_url, start, budget, follow=follow_redirects, headers=headers
                 )
-        except (FetchError, TimeoutError, httpx.RequestError) as exc:
+        except (FetchError, TimeoutError, httpx.RequestError, UnicodeError) as exc:
             err = exc if isinstance(exc, FetchError) else _as_fetch_error(exc)
             log.warning("fetch failed", extra={"url": safe_url(raw_url), "code": err.code})
             raise err from None
@@ -158,7 +163,7 @@ class Fetcher:
         try:
             async with asyncio.timeout(self._total_timeout):
                 return await self._robots.rules_for(parse_http_url(raw_url))
-        except (TimeoutError, httpx.RequestError) as exc:
+        except (TimeoutError, httpx.RequestError, UnicodeError) as exc:
             raise _as_fetch_error(exc) from None
 
     def cached_robots_rules(self, raw_url: str) -> Rules | None:

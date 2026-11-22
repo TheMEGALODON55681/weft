@@ -16,25 +16,23 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-import uvicorn
 from fastmcp import Client
 from mcp.shared.exceptions import MCPError
 
 from fixture_site import FixtureSite
+from http_app import TOKEN, remote, serve
 from weft.config import Settings
 from weft.db import Database
 from weft.server import app as server_app
-from weft.server.app import build_server
 from weft.server.auth import BearerToken
 
-TOKEN = "t0ken-" + "x" * 30
 INITIALIZE = {
     "jsonrpc": "2.0",
     "id": 1,
@@ -46,39 +44,6 @@ INITIALIZE = {
     },
 }
 MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
-
-
-@asynccontextmanager
-async def serve(settings: Settings) -> AsyncIterator[str]:
-    """The streamable HTTP app on a free loopback port. Yields the base URL."""
-    app = build_server(settings).http_app(transport="http", host_origin_protection="auto")
-    # The shutdown timeout keeps a request that never finishes (a broken health check) from
-    # hanging the test run: the test fails with a read timeout instead.
-    config = uvicorn.Config(
-        app, host="127.0.0.1", port=0, log_config=None, timeout_graceful_shutdown=3
-    )
-    server = uvicorn.Server(config)
-    task = asyncio.create_task(server.serve())
-    try:
-        async with asyncio.timeout(20):
-            while not server.started:
-                if task.done():
-                    task.result()  # raises what stopped it
-                await asyncio.sleep(0.01)
-        port = server.servers[0].sockets[0].getsockname()[1]
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        server.should_exit = True
-        await task
-
-
-def remote(tmp_path: Path, **overrides: Any) -> Settings:
-    return Settings(
-        data_dir=tmp_path / "data",
-        transport="http",
-        auth_token=TOKEN,
-        **overrides,
-    )
 
 
 def http() -> httpx.AsyncClient:

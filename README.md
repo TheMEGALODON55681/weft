@@ -6,7 +6,7 @@ It also crawls. Give it seed URLs and a goal in plain language ("find pricing pa
 
 It can also answer a question about a site. `search_in_site` crawls toward the question and returns the best passages, each with the URL and a snippet. `extract` pulls structured data out of a page, or out of every page of a crawl, as JSON that validates against a schema you write, using CSS and XPath selectors. Two optional extras, both off by default, rerank search hits by meaning and let a language model read a page when the selectors find too little.
 
-This repository is at Phase 6 of 7. Eight tools run over stdio, and over streamable HTTP behind a bearer token for remote connectors: `fetch_page`, `crawl_site`, `get_job`, `cancel_job`, `list_jobs`, `map_site`, `search_in_site` and `extract`. A Dockerfile packages the HTTP server. Load tests and fuzzing come next. [docs/Phases.md](docs/Phases.md) lists what each phase adds.
+All seven planned phases are built. Eight tools run over stdio, and over streamable HTTP behind a bearer token for remote connectors: `fetch_page`, `crawl_site`, `get_job`, `cancel_job`, `list_jobs`, `map_site`, `search_in_site` and `extract`. A Dockerfile packages the HTTP server, and a GitHub Actions workflow builds the image and runs the tests on Linux. [docs/Phases.md](docs/Phases.md) lists what each phase added and what is still open.
 
 ## Install
 
@@ -19,7 +19,7 @@ python -m venv .venv
 
 For development, install the extras: `pip install -e ".[dev]"`.
 
-The repository ships a `uv.lock`. `uv sync --frozen --extra dev` installs the exact versions the tests ran against, and the Docker image installs the same set. `pyproject.toml` holds `fastmcp` to the 4.x series, since the HTTP transport depends on its auth and host-check options.
+The repository ships a `uv.lock`. `uv sync --frozen --extra dev` installs the exact versions the tests ran against, and the Docker image installs the same set. `pyproject.toml` holds `fastmcp` to the 4.x series, since the HTTP transport depends on its auth and host-check options, and lists `starlette`, `uvicorn` and `mcp` because Weft and its tests import them directly. It also lists `sniffio`: `httpcore` imports it on every request, and without it fetches ran about five times slower.
 
 Rendering JavaScript pages needs a headless Chromium, which is a separate download of about 290 MB on disk:
 
@@ -359,7 +359,7 @@ Weft fetches whatever URL an agent gives it, and the agent may have picked that 
 
 **Addresses.** Weft resolves the host name itself, checks every address that comes back, and connects to one it checked. It refuses private, loopback, link-local, carrier-grade NAT, multicast and reserved ranges, the cloud metadata addresses (AWS, Google Cloud, Azure, Alibaba, Oracle), and IPv6 forms that wrap those. If any address in an answer is refused, the whole name is refused, and the error never says where the name pointed. Weft judges what a name resolves to, so odd spellings of an address, such as `2130706433` or `[::ffff:7f00:1]`, cannot slip past the check. The check and the connection share one lookup, so a DNS answer that changes between them cannot get a request through.
 
-**robots.txt.** Weft obeys it, using the name `weft`, and has no switch to turn that off. The rules follow RFC 9309: the longest matching rule wins, `Allow` wins a tie, `*` and `$` work in paths, and a group that names `weft` beats the `*` group. A missing or forbidden file (any 4xx except `429`) means no restrictions. A server error or `429` means off limits for the next minute. Weft reads at most the first 500 KiB, caches the result for an hour per origin, and honours `Crawl-delay`. The `/robots.txt` URL itself can always be fetched.
+**robots.txt.** Weft obeys it, using the name `weft`, and has no switch to turn that off. The rules follow RFC 9309: the longest matching rule wins, `Allow` wins a tie, `*` and `$` work in paths, and a group that names `weft` beats the `*` group. A rule and a request path are compared in one spelling: non-ASCII characters become UTF-8 escapes, hex digits are upper case, and an escape of a letter, digit, `-`, `.`, `_` or `~` is decoded. An escape of a reserved character stays an escape, so `%2F` is not a slash and `%2A` is not a wildcard. A line ends at CR, LF or CRLF. A missing or forbidden file (any 4xx except `429`) means no restrictions. A server error or `429` means off limits for the next minute. Weft reads at most the first 500 KiB, caches the result for an hour per origin, and honours `Crawl-delay`. The `/robots.txt` URL itself can always be fetched.
 
 **Pacing.** By default Weft starts at most one request per second to a host, keeps at most two in flight to it, and at most sixteen overall. A longer `Crawl-delay` wins. Redirect hops and retries count as requests. If a call's turn would come after more than `total_timeout_s`, it fails at once with `rate_limited` and says how long to wait, instead of blocking the agent. Reading robots.txt is not spaced, so the first page on a new host does not wait for it.
 
@@ -455,8 +455,10 @@ Each setting has an environment variable named `WEFT_` plus the uppercase settin
 - The Docker image names its base by tag, not by digest, and the system libraries come from Debian when you build.
 - Cookies are neither stored nor sent. Authenticated crawling will take cookies per job.
 - Pacing is per host name and per process. `example.com` and `www.example.com` are separate hosts, and two Weft processes do not share a limit. Two servers on one data directory would also both resume the same jobs, so run one per directory.
-- A page that hangs the extractor frees the caller after `extract_timeout_s`, but the worker thread cannot be stopped. Four stuck pages switch extraction off until they finish or the server restarts.
-- Jobs, their frontier rows and cached pages are never deleted. Expired cache rows are kept for their validators. A long-lived data directory grows until you remove `weft.db`.
+- A page that hangs the extractor frees the caller after `extract_timeout_s`, but the worker thread cannot be stopped. Four stuck pages switch extraction off until they finish or the server restarts. Weft cuts a document that nests more than 5,000 elements deep before parsing it, because the HTML parser's time grows with the square of the depth. A page written to get around that can still hold a thread.
+- Extraction takes time in proportion to page size: about 4 microseconds a byte on plain text and about 100 microseconds a link on a page that is mostly links. A 2 MB article can take 30 seconds and a 6 MB page of 200,000 links more than a minute, which is past `extract_timeout_s`. The caller gets `extraction_timeout`, and the thread finishes in the background. Lowering `max_body_bytes` keeps pages under that.
+- A robots.txt of 500 KiB, the most Weft reads, holds about 25,000 rules and costs 5 to 10 ms to check against one URL. Real files have a few hundred rules.
+- Jobs, their frontier rows and cached pages are never deleted. Expired cache rows are kept for their validators. A long-lived data directory grows until you remove `weft.db`, at about 5 KB for each crawled page.
 - Canonicalisation sorts query parameters and drops tracking parameters, and the crawl fetches the canonical form. A site that depends on parameter order would see a different request.
 - Near-duplicate detection is tuned for pages of a few hundred words. Pages under 30 words are compared by exact text only.
 - Relevance scores use corpus statistics from the pages a job has fetched. A resumed job starts those statistics again, so scores before and after a restart are not exactly comparable.
@@ -474,15 +476,19 @@ Each setting has an environment variable named `WEFT_` plus the uppercase settin
 ## Development
 
 ```bash
-pytest                  # about four minutes, includes a real stdio round trip, a server process on
-                        # a local port and a killed crawl
+pytest                  # about seven minutes, includes a real stdio round trip, a server process on
+                        # a local port, a killed crawl and the fuzz and load tests
 ruff check .
 ruff format --check .
 mypy                    # strict, covers src/weft
 uv lock --check         # fails when pyproject.toml and uv.lock disagree
 ```
 
-Tests never touch the internet. They run against a small local web server in `tests/fixture_site.py`, so the suite runs with `allow_loopback` on and spacing off. The HTTP tests start a server on a free loopback port, and one of them starts `python -m weft` as a child process. `tests/test_docker.py` checks the Dockerfile as text and runs its health check against a real server. It builds no image. The tests for the address guard and the limiter turn those back to their defaults. The browser tests start a real headless Chromium and need `chromium-headless-shell` installed. Without it they are skipped, in `tests/test_browser.py` and `tests/test_page.py` alike.
+Two environment variables scale the heavy tests. `WEFT_FUZZ_EXAMPLES=20000 pytest tests/test_fuzz.py` draws that many examples per property from a random seed, for a deep run before a release. The default run draws 1,000 from a fixed one, so a red build means a code change. `WEFT_LOAD_PAGES=5000 pytest tests/test_load.py -s` crawls a generated site of that many pages and prints throughput, latency, memory and database size. The default is 400.
+
+CI (`.github/workflows/ci.yml`) runs three jobs on Linux: lint and types, the suite with real Chromium, and the Docker image, which is built, run through the suite and checked for the token refusal, `/healthz` and a clean stop on `SIGTERM`. A failed job ends with the commands that reproduce it.
+
+Tests never touch the internet. They run against a small local web server in `tests/fixture_site.py`, so the suite runs with `allow_loopback` on and spacing off. HTTP/2 runs against a server of its own in `tests/h2_site.py`. The HTTP tests start a server on a free loopback port, and one of them starts `python -m weft` as a child process. `tests/test_docker.py` checks the Dockerfile as text and runs its health check against a real server. It builds no image: CI does. The tests for the address guard and the limiter turn those back to their defaults. The browser tests start a real headless Chromium and need `chromium-headless-shell` installed. Without it they are skipped, in `tests/test_browser.py` and `tests/test_page.py` alike, unless the variable `CI` is set, which turns the skip into a failure so that a broken browser install cannot pass as a green run.
 
 Playwright is pinned to one minor release in `pyproject.toml`, because each release drives its own Chromium build. After raising the pin, run `playwright install chromium-headless-shell` again.
 

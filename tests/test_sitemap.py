@@ -1,4 +1,5 @@
 import gzip
+import time
 
 import pytest
 
@@ -30,6 +31,65 @@ def test_entities_are_not_expanded_beyond_the_basics() -> None:
     """No XML parser, so a billion-laughs file is just text with no <loc> in it."""
     bomb = b'<!DOCTYPE x [<!ENTITY a "aaaa"><!ENTITY b "&a;&a;&a;">]><urlset>&b;</urlset>'
     assert parse_sitemap(bomb) == ([], [])
+
+
+@pytest.mark.parametrize(
+    ("body", "children", "entries"),
+    [
+        # a <loc> with markup inside is not read, and neither is an empty one
+        (b"<url><loc><![CDATA[https://a.test/c]]></loc></url>", [], []),
+        (b"<url><loc></loc></url>", [], []),
+        (b"<url><loc>  </loc><loc>https://a.test/second</loc></url>", [], []),
+        # a stray <loc> before the real one does not hide it
+        (b"<url><loc>x<loc>https://a.test/y</loc></url>", [], [("https://a.test/y", None)]),
+        # an unclosed block is dropped, and the closed ones before it are kept
+        (
+            b"<url><loc>https://a.test/a</loc></url><url><loc>https://a.test/b</loc>",
+            [],
+            [("https://a.test/a", None)],
+        ),
+        # a block opened twice runs to the first close, as the pattern always did
+        (b"<url><url><loc>https://a.test/n</loc></url>", [], [("https://a.test/n", None)]),
+        # whitespace around a value is trimmed
+        (
+            b"<url><loc>https://a.test/t</loc><lastmod>\n 2026-01-02\t</lastmod></url>",
+            [],
+            [("https://a.test/t", "2026-01-02")],
+        ),
+        (b"<urlset><loc>https://a.test/outside</loc></urlset>", [], []),
+    ],
+)
+def test_odd_shapes(
+    body: bytes, children: list[str], entries: list[tuple[str, str | None]]
+) -> None:
+    assert parse_sitemap(body) == (children, entries)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"<url>" * 40_000,
+        b"<sitemap>" * 25_000,
+        b"<url><loc>" + b" " * 40_000 + b"x</url>",
+        b"<url><loc>" + b" " * 20_000 + b"x" + b" " * 20_000 + b"</url>",
+        b"<url><loc>" * 20_000 + b"</url>",
+        b"<url><lastmod>" + b" " * 40_000 + b"x</url>",
+    ],
+    ids=[
+        "url-never-closed",
+        "sitemap-never-closed",
+        "loc-spaces",
+        "loc-both-sides",
+        "loc-many",
+        "lastmod",
+    ],
+)
+def test_hostile_files_are_read_in_linear_time(body: bytes) -> None:
+    """The pattern this replaced took 12 s on the first of these and 26 s on the fourth at a tenth
+    of their size, and the parser runs on the event loop, so one such file stalled the server."""
+    start = time.perf_counter()
+    parse_sitemap(body)
+    assert time.perf_counter() - start < 1
 
 
 def test_gzip_is_unpacked_up_to_the_cap() -> None:

@@ -309,6 +309,25 @@ SITE_PAGES: dict[str, bytes] = {
 }
 
 
+# 300 KB of nested divs after a title and a paragraph: lexbor took two minutes on a bigger one.
+DEEP_HTML = (
+    "<html><head><title>Kept title</title></head><body><p>"
+    + "word " * 40
+    + "</p>"
+    + "<div>" * 60_000
+    + "</body></html>"
+).encode()
+
+
+# A script nests the DOM 8,000 levels deep, whatever the parser would have allowed.
+DEEP_JS_HTML = (
+    "<html><head><title>Kept title</title></head><body><p>" + "word " * 60 + "</p>"
+    "<script>let n = document.body;"
+    "for (let i = 0; i < 8000; i++) { const d = document.createElement('div');"
+    " n.appendChild(d); n = d; }</script></body></html>"
+).encode()
+
+
 def _site(h: BaseHTTPRequestHandler) -> None:
     _send(h, SITE_PAGES[urlsplit(h.path).path])
 
@@ -365,6 +384,45 @@ for _n, (_title, _pay, _href) in enumerate(_ROLES):
         _para(f"Join the {_title.lower()} team. " + _unique_text(3000 + _n))
         + f'<p>Salary: <span class="salary">${_pay:,}</span> a year.</p>',
     )
+
+
+LOAD_FANOUT = 5
+
+
+def _load(h: BaseHTTPRequestHandler) -> None:
+    """/load/<i>: page i of a generated site of `load_pages` pages (see `run_site`). Page i links to
+    pages 5i+1 to 5i+5, so the site is a tree and a crawl that reaches every page reaches each one
+    once. Every page has text of its own, so none is a near duplicate of another, and takes 2 ms,
+    so that concurrent requests overlap and the peak the server records means something."""
+    st = _state(h)
+    try:
+        i = int(urlsplit(h.path).path.rsplit("/", 1)[1])
+    except ValueError:
+        i = -1
+    if not 0 <= i < st.load_pages:
+        _send(h, b"not found", status=404, ctype="text/plain")
+        return
+    with st.lock:
+        st.load_active += 1
+        st.load_peak = max(st.load_peak, st.load_active)
+    try:
+        time.sleep(0.002)
+    finally:
+        with st.lock:
+            st.load_active -= 1
+    children = range(LOAD_FANOUT * i + 1, LOAD_FANOUT * i + 1 + LOAD_FANOUT)
+    links = [(f"/load/{c}", f"Page {c}") for c in children if c < st.load_pages]
+    text = _para(*(f"Page {i}, part {k}. " + _unique_text(i + k * 10_000_000) for k in range(3)))
+    _send(h, _page(f"Load page {i}", text, links))
+
+
+# Reached only from here. One link goes to a host that idna cannot decode: "xn--" is made of
+# letters, so it canonicalises, and it used to stop the crawl in the robots.txt lookup.
+SITE_PAGES["/site/odd-hosts"] = _page(
+    "Odd hosts",
+    _para(_FILLER, "This page links to a host with a malformed internationalised name."),
+    [("http://xn--/a", "Strange"), ("/site/about", "About us")],
+)
 
 
 def _trap(h: BaseHTTPRequestHandler) -> None:
@@ -496,6 +554,8 @@ ROUTES: dict[str, Callable[[BaseHTTPRequestHandler], None]] = {
     "/ping": lambda h: _send(h, b"<html><title>pong</title></html>"),
     "/hold": _hold,
     "/js-shell": lambda h: _send(h, JS_SHELL_HTML.encode()),
+    "/deep": lambda h: _send(h, DEEP_HTML),
+    "/deep-js": lambda h: _send(h, DEEP_JS_HTML),
     "/goto": _goto,
     "/script.js": lambda h: _send(h, b"window.loaded = true;", ctype="text/javascript"),
     "/sw.js": lambda h: _send(h, b"self.oninstall = () => {};", ctype="text/javascript"),
@@ -517,6 +577,7 @@ PREFIX_ROUTES: dict[str, Callable[[BaseHTTPRequestHandler], None]] = {
     "/reset/": _reset,
     "/private/": lambda h: _send(h, b"<html><title>private</title></html>"),
     "/trap/": _trap,
+    "/load/": _load,
     "/blob/": _blob,
 }
 
@@ -548,10 +609,13 @@ class _Server(ThreadingHTTPServer):
     """The server plus what the handlers record. `robots` is the body of /robots.txt, an HTTP
     status to answer it with, or None for a 404."""
 
-    def __init__(self, robots: str | int | None) -> None:
+    def __init__(self, robots: str | int | None, load_pages: int = 0) -> None:
         super().__init__(("127.0.0.1", 0), _Handler)
         self.daemon_threads = True
         self.robots = robots
+        self.load_pages = load_pages
+        self.load_active = 0
+        self.load_peak = 0
         self.lock = threading.Lock()
         self.hits: Counter[str] = Counter()
         self.times: defaultdict[str, list[float]] = defaultdict(list)
@@ -597,12 +661,20 @@ class FixtureSite:
         """Most /hold requests ever in flight at once."""
         return self._server.peak
 
+    @property
+    def load_peak(self) -> int:
+        """Most /load requests ever in flight at once."""
+        return self._server.load_peak
+
 
 @contextmanager
 def run_site(
-    robots: str | int | None = DEFAULT_ROBOTS, tls: ssl.SSLContext | None = None
+    robots: str | int | None = DEFAULT_ROBOTS,
+    tls: ssl.SSLContext | None = None,
+    load_pages: int = 0,
 ) -> Iterator[FixtureSite]:
-    server = _Server(robots)
+    """`load_pages` is the size of the generated site under /load/, 0 for none."""
+    server = _Server(robots, load_pages)
     if tls:
         server.socket = tls.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

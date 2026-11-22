@@ -1,0 +1,200 @@
+# Three jobs, all on ubuntu-latest and independent of each other, so one red job does not hide
+# another. Each failure should name its own step and end with the command that reproduces it.
+#
+#   lint     ruff, the lockfile check and mypy
+#   test     the full suite on Linux, with real headless Chromium
+#   docker   builds the test stage and runs the suite inside it, then builds the runtime image
+#            and checks the three things only a container can show: it refuses to start without
+#            a token, it serves /healthz with one, and it stops on SIGTERM before Docker's kill
+#
+# No secrets are used. The token in the docker job is random and lives for one run. Both actions
+# are pinned to a commit, with the release it is written next to.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The uv that wrote uv.lock, and the one the Dockerfile installs.
+  UV_VERSION: "0.11.23"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  lint:
+    name: lint and types
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python 3.12
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install the locked dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: uv.lock agrees with pyproject.toml
+        run: uv lock --check
+
+      - name: ruff check
+        run: uv run --no-sync ruff check --output-format=github .
+
+      - name: ruff format
+        run: uv run --no-sync ruff format --check --diff .
+
+      - name: mypy (strict, src/weft)
+        run: uv run --no-sync mypy
+
+      - name: How to reproduce
+        if: failure()
+        run: |
+          {
+            echo "### Reproduce locally"
+            echo '```'
+            echo "uv sync --frozen --extra dev"
+            echo "uv lock --check"
+            echo "uv run ruff check . && uv run ruff format --check --diff . && uv run mypy"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: tests on Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # tests/skips.py turns "Chromium is missing" from a skip into a failure when this is set,
+      # so a broken browser install cannot pass as a green run.
+      CI: "true"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python 3.12
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install the locked dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Install headless Chromium and its system libraries
+        run: uv run --no-sync playwright install --with-deps chromium-headless-shell
+
+      - name: Run the full suite
+        run: uv run --no-sync pytest -ra --tb=short --durations=15 -p no:cacheprovider
+
+      - name: How to reproduce
+        if: failure()
+        run: |
+          {
+            echo "### Reproduce locally"
+            echo '```'
+            echo "uv sync --frozen --extra dev"
+            echo "uv run playwright install --with-deps chromium-headless-shell"
+            echo "CI=true uv run pytest -ra --tb=short"
+            echo '```'
+            echo "The failing tests are in the short test summary at the end of the step's log."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  docker:
+    name: image and suite in Docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DOCKER_BUILDKIT: "1"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the test stage
+        run: docker build --target test --tag weft-test .
+
+      - name: Run the full suite inside the test stage
+        run: docker run --rm --init --env CI=true weft-test pytest -ra --tb=short -p no:cacheprovider
+
+      - name: Build the runtime image
+        run: docker build --tag weft .
+
+      - name: Without a token the container exits with code 2
+        run: |
+          code=0
+          docker run --rm weft || code=$?
+          echo "exit code: $code"
+          test "$code" -eq 2
+
+      - name: With a token the container turns healthy
+        run: |
+          export WEFT_AUTH_TOKEN="$(openssl rand -hex 24)"
+          docker run --detach --name weft-smoke --init --publish 8000:8000 \
+            --env WEFT_AUTH_TOKEN --volume weft-data:/data \
+            --memory 2g --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges weft
+          healthy=""
+          for _ in $(seq 1 60); do
+            if curl --silent --fail --max-time 3 http://127.0.0.1:8000/healthz; then
+              healthy=yes
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$healthy" ]; then
+            echo "::error::/healthz did not answer within 60 seconds"
+            docker logs weft-smoke
+            exit 1
+          fi
+          echo
+          status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --request POST http://127.0.0.1:8000/mcp)"
+          echo "POST /mcp without a token: $status"
+          test "$status" -eq 401
+
+      - name: The container stops on SIGTERM before Docker kills it
+        run: |
+          docker stop --time 15 weft-smoke
+          code="$(docker inspect --format '{{.State.ExitCode}}' weft-smoke)"
+          echo "exit code after docker stop: $code (137 would mean it was killed)"
+          test "$code" -ne 137
+          docker logs weft-smoke 2>&1 | tail -n 20
+
+      - name: Container log
+        if: failure()
+        run: docker logs weft-smoke 2>&1 | tail -n 100 || true
+
+      - name: Remove the container
+        if: always()
+        run: docker rm --force weft-smoke || true
+
+      - name: How to reproduce
+        if: failure()
+        run: |
+          {
+            echo "### Reproduce locally"
+            echo '```'
+            echo "docker build --target test -t weft-test ."
+            echo "docker run --rm --init -e CI=true weft-test"
+            echo "docker build -t weft ."
+            echo "docker run --rm weft; echo \$?   # expect 2"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

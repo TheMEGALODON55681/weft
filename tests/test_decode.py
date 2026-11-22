@@ -35,6 +35,11 @@ def test_unknown_header_charset_is_ignored() -> None:
     assert decode_body("héllo".encode(), "no-such-codec") == "héllo"
 
 
+def test_a_header_charset_that_is_not_a_codec_name_at_all_is_ignored() -> None:
+    # bytes.decode raises ValueError, not LookupError, for a codec name with a null byte in it.
+    assert decode_body("héllo".encode(), "utf\x00-8") == "héllo"
+
+
 def test_undeclared_legacy_encoding_is_detected() -> None:
     text = "Это достаточно длинный русский текст, чтобы определить кодировку. " * 5
     assert "кодировку" in decode_body(text.encode("windows-1251"), None)

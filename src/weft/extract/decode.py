@@ -27,7 +27,7 @@ def decode_body(body: bytes, header_charset: str | None) -> str:
         encoding = "cp1252" if label.lower() in _LATIN1_LABELS else label
         try:
             return body.decode(encoding)
-        except (LookupError, UnicodeDecodeError):
+        except (LookupError, ValueError):  # no such codec, a bad byte, or a name with a NUL in it
             continue
 
     try:

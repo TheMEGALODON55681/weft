@@ -14,11 +14,15 @@ from pathlib import Path
 
 import pytest
 
-from test_http import _inherit, http, remote, serve
+from http_app import remote, serve
+from test_http import _inherit, http
 from weft.db import Database
 from weft.server import app as server_app
 
 DOCKERFILE = Path(__file__).parent.parent / "Dockerfile"
+
+if not DOCKERFILE.exists():  # the image's test stage holds tests/ and the package, not the repo
+    pytest.skip("the Dockerfile is not in this tree", allow_module_level=True)
 
 
 def stage(name: str) -> str:

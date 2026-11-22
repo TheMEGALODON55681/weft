@@ -604,3 +604,117 @@ Close a Phase 5 gap: a page with an error status is never sent to the model.
 The image was not built, because the build machine has no container runtime.
 Docs updated.
 ```
+
+## Phase 7: hardening (2026-11-21)
+
+### Done
+
+A CI workflow, direct dependencies and a refreshed lockfile (the two Phase 6 gaps), then the hardening phase: fuzzing, an HTTP/2 test through the guarded transport, a load test, the robots.txt percent-encoding gap, and the docs. Fuzzing and load testing found seven defects in the existing code, all fixed (the sitemap parser, `xn--` hosts, canonical hosts, a charset name, robots.txt line endings, deep nesting and a missing `sniffio`). New: `.github/workflows/ci.yml`, `extract/nesting.py`, and `tests/test_fuzz.py`, `test_http2.py`, `test_load.py`, `test_nesting.py`, `test_ci.py` with the helpers `h2_site.py`, `http_app.py`, `certs.py`, `rss.py` and `skips.py`. Four dependencies were added (`sniffio`, and `starlette`, `uvicorn` and `mcp` declared), one dev dependency (`hypothesis`), and the lockfile moved from 99 to 102 packages. No setting was added. The suite grew from 685 to 843 tests. Nothing was committed, tagged or pushed.
+
+The request named the work: a load test against the fixture site, fuzzing of URL canonicalisation and of HTML, robots.txt and sitemap parsing, an HTTP/2 test, the robots.txt percent-encoding gap and the docs, plus the CI workflow and the dependency declarations. Retention for jobs and cache rows was not on the list, so it stays open.
+
+### Verification
+
+- The suite. `pytest` ran 843 tests on a quiet machine, with none failed and none skipped, in 6 minutes 55 seconds. Phase 6 ended at 685. An earlier full run, cut short by a session interruption, reported 17 failures and 4 errors, 16 of them `Connection closed while reading from the driver` from Playwright, and the rest child-process tests (a server that exited early, a health check, a killed crawl). I did not diagnose that run. The same tests passed when nothing interrupted them, which fits a driver and child processes killed mid-run and does not prove it. The `render_failed` error in that output came from one of the browser tests that lost its driver.
+- Lint and types. `ruff check` is clean, `ruff format --check` finds 88 files formatted, and `mypy` in strict mode finds no issues in 44 source files. They ran after the last code change.
+- Mutation checks. 31 hand-written mutants of the Phase 7 code in seven groups: robots.txt normalisation and line endings (8), the sitemap scanner (4), host canonicalisation (5), the nesting scan (9), the fetcher's `UnicodeError` and `ValueError` handling (3), the charset handling in the decoder (1) and the nesting call in `page.py` (1). 30 were caught on the first run. The survivor was the `ValueError` branch of `parse_http_url`, which exposed the `cached_robots_rules` path (see Review), and two tests now catch it. The SHA-256 of every file the harness touched matched before and after.
+- Deep fuzz. With the property set as it ends this phase, `WEFT_FUZZ_EXAMPLES=4000` drew 4,000 examples per property from a random seed (a tenth for the HTML ones), and all 28 tests in `tests/test_fuzz.py` passed in 3 minutes. The earlier run of 8,000 examples came before the nesting properties and the hostile-page table existed, so this one is the check on the final set.
+- The h2 fixture. Four mutants (HTTP/2 forced off, no address check, certificate verification off, no body cap) are each caught by the tests meant to catch them.
+- Load. On this Windows laptop with `WEFT_LOAD_PAGES=5000`, a crawl with 16 workers took 154 seconds (32 pages a second, 43 at 400 pages). Every page was fetched once, with no failure and no duplicate, resident memory grew by 6 MB, the database reached 27 MB, and the server never saw more than two requests in flight. A burst of 5,000 fetches ran at 152 a second. Eight MCP clients over HTTP kept the per-host cap, and `/healthz` answered within about 350 ms. The suite runs the 400-page size by default.
+- Environment. `uv lock --check` passes and the virtual environment is synced to the lock.
+- Not verified. **The workflow has never run and the Docker image has never been built**: this machine has no container runtime and WSL has no distribution. The suite has not run on Linux, so the `SIGTERM` branch of the child-process tests and the Debian package step are untested. The load numbers, the h2 fixture and the timings come from one Windows laptop. The nesting cap is a heuristic with the bypasses its docstring lists.
+
+### Decisions
+
+- **Three independent CI jobs.** Lint and types, the suite with Chromium, and the image. A red job hides none of the others, and each names its own step. Every job ends, on failure, with the commands that reproduce it. The two actions are pinned to commits, and a test reads the workflow as text so that an unpinned action, a secret, a write permission or a dropped command fails the suite. A Chromium that is missing in CI fails the run. Locally it still skips.
+- **The image check goes past the suite.** The suite in the `test` stage proves the package works on Linux. Three things only the runtime image shows are checked separately: it exits with code 2 without a token, it turns healthy with one under the README's flags, and `docker stop` ends it before the grace period, which is what a clean `SIGTERM` path looks like from outside (exit code 137 would mean a kill).
+- **hypothesis, with a fixed seed by default.** The alternative was a seeded `random` loop, which has no shrinking and prints a 400-character URL instead of the three-character one that broke it. The default profile draws the same 1,000 examples every run, so a red build means a code change. `WEFT_FUZZ_EXAMPLES` draws more from a random seed for a deep run. The example database is off, so nothing is written into the repository.
+- **sniffio is a dependency.** httpcore imports it inside a function that runs five times per request. When it is missing, each import searches `sys.path` again and fails. The load test measured 40 to 50 fetches a second without it and 200 to 240 with it. The package is a few hundred lines with no dependencies.
+- **robots.txt is normalised on both sides, once.** The rule is normalised at parse time and the path at each check, by one function, as RFC 9309 section 2.2.2 says. A rule's length for "longest wins" is its normalised length. An escape is read once, so `%2541` stays `%2541`. That makes the function not idempotent in one corner (`%%341` becomes `%41`, which a second pass would decode), and it does not matter: each side is normalised exactly once. Rules are not normalised where `Rules` is built in code, which only tests do.
+- **The sitemap scan uses `find`.** The patterns it replaces were quadratic and cubic on hostile input. A regular expression with a guard would have been shorter. A scan that stops at the next `<`, and a block search that stops when no close remains ahead, are linear by construction, and the linear-time tests say so.
+- **A host that cannot be a name is refused at canonicalisation.** Letters, digits, `-` and `_` in non-empty labels, or an IPv6 address. Before, a URL with a space or an empty label was queued, refused by the fetcher and recorded as a failure, for no gain. A name that passes this check can still be refused later (`xn--` is letters), so the fetcher's own handling stays.
+- **The nesting cap is a scan with a limit of 5,000.** See Problems hit for the design that was dropped. 5,000 levels cost the parser 0.03 s, ten times what browsers allow, and no real page comes near. It cuts the document, since the content before the cut is real and what follows is junk.
+- **Extraction on big pages is documented, not changed.** A 2 MB page of plain paragraphs takes 30 seconds, and a 6 MB page of 200,000 links 96. The cost is linear, in trafilatura and in a second metadata parse. Doing the work once with `bare_extraction` would roughly halve it and change what gets extracted. That is a decision with its own tests, so it is left, with numbers, in the docs.
+- **The load test thresholds are loose.** They catch a leak, a stall and a broken cap. A throughput floor would fail on a slow machine for no reason, so throughput is printed and not asserted.
+
+### Problems hit
+
+- **The first fuzz run passed every property and meant nothing.** It drew 150 examples per property, and none was one of the hostile hosts. Probing `canonicalize` by hand showed three failures the run had missed (`http://./` gave `http:///`). Raising the default to 1,000 examples found two more. A passing fuzz run needs a reason to believe it could fail, so I read the draws, probed by hand, and ran 8,000 examples from a random seed (17 of 17 properties held after the fixes, 317 seconds).
+- **My first sitemap timing probe measured nothing.** It had `<loc>` with no `</url>` around it, so the pattern never ran. With the close in place, 2,000 spaces on each side of one `x` took 26 seconds.
+- **Fixing `parse_http_url` did not fix the redirect.** The fuzz example was a URL, and httpx raises idna's error from `url.host`, so that fix was right for it. A redirect to `http://xn--/` failed the same way inside httpx, which builds the next request even with redirects off. The fix there is a `UnicodeError` branch in `Fetcher.fetch`, written after the second test failed.
+- **Scripted edits mangled escapes again.** A heredoc turned `\x00` into a real NUL byte in a test file, which made pytest refuse to collect it. A tool call turned ` ` into the character itself, and `sed` ate a backslash. File content goes through the editor tools, and the few escapes that matter are written as `chr()` or `\N{...}`.
+- **The crawl test asserted that requests overlap.** It failed with a peak of 1 in flight at the server, with 16 workers. The requests do not overlap because the pages arrive faster than extraction and the database can take them. The assertion now checks the cap and the report shows the peak.
+- **The Docker test stage would have failed on its first run.** `tests/test_docker.py` reads the Dockerfile, and the stage copies `tests/` and the package, not the repository. Found by reading what the stage copies. The module and `test_ci.py` skip themselves when their file is absent.
+- **The HTTP/2 tests passed on their first run.** That shows they ran, not that they can fail. Four mutants (http2 forced off, no address check, certificate verification off, no body cap) are each caught by the tests meant to catch them.
+- **The design I dropped for the nesting cap.** Emulating the parser's stack of open elements, with its rules for which end tags are ignored, gives an exact depth and a guarantee. It also means rewriting the HTML tree builder, and any difference from lexbor is a hole. The counter has fewer rules and a known set of bypasses, which the module's docstring lists.
+- **A one-line probe was a Windows quirk, so I thought.** 51 fetches a second looked like loopback overhead. `cProfile` showed 13 of 21 seconds inside `importlib`, failing to find `sniffio`.
+
+### Review
+
+I reviewed the code in this session from four angles (correctness, security, concurrency, maintainability) and reconciled the findings, then ran an over-engineering review.
+
+Fixed:
+
+- **A surviving mutant exposed a third path for the `xn--` bug.** `Fetcher.cached_robots_rules`, which the crawl calls for every link it finds, let idna's error escape, so one hostile link failed the whole job. Neither the fuzz run nor the first regression tests reached it, and the mutation run did: removing the `ValueError` branch of `parse_http_url` survived. Two tests now cover it, a unit test and a crawl over a page that links to `http://xn--/a`. With the branch removed, the job fails.
+- **A nesting cap on the rendered path that could never run.** I wired `cap_nesting` into the browser path as well, then wrote the test for it. Chromium's headless shell cannot serialise a DOM nested more than a few hundred levels (the tab crashes between 100 and 300 levels here), so a script that nests deeper fails the render before the cap sees it. The code is gone. The test now says what does happen: `render_failed`, and the pool renders the next page.
+- **The Docker test stage would have failed on its first run** (see Problems hit), found by the correctness pass reading what the stage copies.
+- **A test module named `remote` that held a function named `remote`.** Renamed `http_app`.
+- **Two load assertions that depended on the machine.** That requests overlap, and a ceiling on `/healthz` latency. The first was false (see Problems hit) and the second would fail on a slow runner for no reason. A 200 from `/healthz` already means under two seconds.
+- **Over-engineering review.** Cut four legacy element names from the nesting set (`frame`, `basefont`, `bgsound`, `keygen`) and a fuzz property that the structured robots property already covers. Kept: the HTTP/1.1 answer in `h2_site.py` (the `http2 = false` test needs it), the `limit` parameter of `cap_nesting` (the fuzz tests use small limits), `tests/skips.py` (eight lines, and what turns a missing browser into a CI failure), the Windows branch of `tests/rss.py` (memory under load was a stated gap since Phase 3), and the reproduction steps at the end of each CI job. Declined with a reason: a trie for robots.txt rules (a real file has hundreds of rules, and the cost is documented), a child process for extraction (its own phase), `bare_extraction` to parse once (changes what is extracted), retention (not asked for), a PyYAML dependency to read the workflow (a regular expression does it), and `docker/setup-buildx-action` (the runner's Docker builds the image).
+
+Accepted and recorded, not fixed:
+
+- The workflow has not run and the image has never been built. The suite has never run on Linux. The first push is the test of all three, and of the `SIGTERM` branch of the child-process tests.
+- The nesting cap is a scan with known bypasses. Extraction threads still cannot be stopped.
+- Extraction takes 30 seconds on a 2 MB page of plain paragraphs and 96 on a 6 MB page of links, and the caller gets `extraction_timeout` first.
+- A robots.txt at the read limit costs 5 to 10 ms per check.
+- Crawl throughput falls from 43 pages a second at 400 pages to 32 at 5,000, and I did not find out why.
+- The h2 fixture, the load numbers and the CI timings come from one Windows laptop.
+- Carry-overs from Phases 2 to 6 are unchanged.
+
+The jury was again one reviewer playing four roles. The parts most worth an outside read are the workflow on its first run and `extract/nesting.py`, a heuristic with a known set of bypasses.
+
+### Commit message draft
+
+```
+Phase 7: hardening, CI and direct dependencies
+
+Add .github/workflows/ci.yml with three independent jobs on Linux: lint,
+format, lock check and mypy; the suite with real Chromium; and the Docker
+image, which is built, run through the suite, and checked for the token
+refusal, /healthz, a 401 on /mcp and a clean stop. Actions are pinned to
+commits and the token is read-only. A test pins the workflow as text. When
+CI is set, a missing Chromium fails the run instead of skipping.
+
+Declare starlette, uvicorn and mcp, which the code imports directly, and add
+sniffio: httpcore imports it inside a function that runs several times per
+request, and without it every call searched sys.path again and failed, so
+fetches ran at 40 to 50 a second instead of 200 to 240. Add hypothesis for
+development and refresh uv.lock.
+
+Fuzz the URL, HTML, robots.txt, sitemap and response-body handling with
+hypothesis (1,000 examples from a fixed seed by default, WEFT_FUZZ_EXAMPLES
+for a deep run). Fixes it forced:
+- The sitemap scanner used patterns that were quadratic and cubic on
+  hostile input (12 s on 100 KB of unclosed tags, on the event loop). It is
+  now a linear scan.
+- A host such as xn-- made idna raise out of the fetcher, the robots lookup
+  and the redirect request, which failed a whole crawl. Those become
+  invalid_url, and canonicalisation refuses hosts that cannot be names.
+- A charset name containing NUL raised while decoding.
+- robots.txt lines now end at CR, LF or CRLF only.
+- A document nested more than 5,000 elements deep is cut before parsing,
+  because the parser's time grows with the square of the depth.
+
+Normalise robots.txt rules and request paths to one spelling as RFC 9309
+section 2.2.2 says: UTF-8 escapes for non-ASCII, upper-case hex, and
+unreserved characters decoded.
+
+Add an HTTP/2 test server over TLS and eleven tests through the guarded
+transport, and a load test against a generated fixture site (WEFT_LOAD_PAGES
+sets the size): every page fetched once, per-host cap held, memory and
+database size measured, eight HTTP clients served while /healthz answers.
+
+The workflow has not run and the Docker image was not built, because this
+machine has no container runtime, so neither is verified. Docs updated.
+```

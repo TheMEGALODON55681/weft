@@ -192,6 +192,26 @@ async def test_the_html_of_a_rendered_page_is_the_dom_its_text_came_from(
     assert doc.html is not None and '<div id="root"><article>' in doc.html
 
 
+async def test_a_script_that_nests_the_dom_far_too_deep_fails_the_render_and_the_pool_survives(
+    site: FixtureSite, chromium
+) -> None:
+    """Chromium cannot serialise a DOM nested more than a few hundred levels: the tab crashes. So
+    nesting on the rendered path is bounded by the browser, and the nesting cap is not applied
+    there. The failure has to stay a clean render_failed, and the pool has to go on working."""
+    settings = Settings()
+    fetcher = Fetcher(settings)
+    pool = BrowserPool(settings, fetcher)
+    try:
+        with pytest.raises(FetchError) as e:
+            await get_document(fetcher, settings, site.url("/deep-js"), "always", pool)
+        assert e.value.code == "render_failed"
+        after = await get_page(fetcher, settings, site.url("/js-shell"), "always", browser=pool)
+    finally:
+        await pool.aclose()
+        await fetcher.aclose()
+    assert after.fetch_method == "browser" and "Rendered report" in after.markdown
+
+
 async def test_never_returns_the_shell_as_fetched(page_of) -> None:
     p = await page_of("/js-shell", render="never")
     assert p.fetch_method == "http"
