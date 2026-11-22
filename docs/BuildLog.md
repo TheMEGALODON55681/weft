@@ -1,5 +1,7 @@
 # Build log
 
+Each entry records what was known when it was written, so older entries keep their "not verified" lines as written. The last entry, "CI verified", settles the ones about Linux, the Docker image and the workflow.
+
 ## Phase 1: skeleton (2026-11-19)
 
 ### Done
@@ -503,7 +505,7 @@ dependencies. Docs updated.
 
 ### Done
 
-Streamable HTTP beside stdio, bearer-token auth, `/healthz`, a Dockerfile and a lockfile. `weft --transport http` serves `/mcp` and `/healthz`. stdio stays the default and is unchanged. New files: `server/auth.py`, `Dockerfile`, `.dockerignore`, `uv.lock`, `tests/test_http.py` and `tests/test_docker.py`. Four new settings (`transport`, `http_host`, `http_port`, `auth_token`), three CLI flags, and 685 tests, 84 more than at the end of Phase 5. No dependency was added, and `fastmcp` is now held to the 4.x series. Nothing was committed, tagged or pushed. The image was never built (see Verification).
+Streamable HTTP beside stdio, bearer-token auth, `/healthz`, a Dockerfile and a lockfile. `weft --transport http` serves `/mcp` and `/healthz`. stdio stays the default and is unchanged. New files: `server/auth.py`, `Dockerfile`, `.dockerignore`, `uv.lock`, `tests/test_http.py` and `tests/test_docker.py`. Four new settings (`transport`, `http_host`, `http_port`, `auth_token`), three CLI flags, and 685 tests, 84 more than at the end of Phase 5. No dependency was added, and `fastmcp` is now held to the 4.x series. Nothing was committed, tagged or pushed. The image was never built (see Verification). CI settled this on 2026-11-22: see "CI verified".
 
 The request was a remote transport with bearer auth, `/healthz` and Docker, plus two extras: a lockfile with a pin on `fastmcp`, and no model call for a page that answered with an error status. That second item closes the Phase 5 decision that declined a status check because nothing asked for it.
 
@@ -521,7 +523,7 @@ The request was a remote transport with bearer auth, `/healthz` and Docker, plus
 - The Dockerfile. Its two `uv sync` steps ran in a scratch environment on Windows and installed the project as a wheel. `tests/test_docker.py` runs the `HEALTHCHECK` command from the file against a healthy server, a server that answers 503 and a closed port, with a proxy variable set that the probe must ignore. It checks as text that the runtime stage is last and unprivileged, that the headless shell and its libraries are installed, that every `uv sync` is frozen, that uv is pinned and that no token is in the image.
 - Environment. `.venv` was synced to the lock with `uv sync --frozen --extra dev`. That moved `fastmcp` from 4.2.2 to 4.2.4 and eleven other packages by a patch release. The full suite passed on that set.
 - Processes. After the last run there is no `python`, `chrome`, `playwright`, `docker` or `weft` process of mine. Two `node.exe` and ten `msedge.exe` processes remain, which I did not start.
-- Not verified. **No container was built or run.** There is no Docker, Podman or Docker Desktop on this machine, so the Debian package step, the browser download, `--cap-drop ALL`, `--init`, `--memory`, the `test` stage, writes to `/data` as uid 10001 and the suite on Linux are all untested. The `SIGTERM` branch of the child-process tests and the POSIX `creationflags` path have not run. No third-party MCP client or hosted connector was tried, so the README's client steps follow the common configuration shape and nothing more. The claim that Playwright launches Chromium with its sandbox off comes from the documented default and the bundled driver's source, not from watching a launch.
+- Not verified. **No container was built or run.** There is no Docker, Podman or Docker Desktop on this machine, so the Debian package step, the browser download, `--cap-drop ALL`, `--init`, `--memory`, the `test` stage, writes to `/data` as uid 10001 and the suite on Linux are all untested. The `SIGTERM` branch of the child-process tests and the POSIX `creationflags` path have not run. No third-party MCP client or hosted connector was tried, so the README's client steps follow the common configuration shape and nothing more. The claim that Playwright launches Chromium with its sandbox off comes from the documented default and the bundled driver's source, not from watching a launch. CI settled the container and Linux items on 2026-11-22: see "CI verified", which also lists what is still open.
 
 ### Decisions
 
@@ -561,7 +563,7 @@ Fixed:
 
 Accepted and recorded, not fixed:
 
-- No image was built. See Verification for the list of what that leaves untested.
+- No image was built. See Verification for the list of what that leaves untested. CI settled this on 2026-11-22: see "CI verified".
 - No real MCP client or hosted connector was tried. Some connector forms offer only OAuth or no authentication, and the README says so.
 - One token and no caller identity. Every holder shares the cache, the jobs and their results, and queued jobs are not capped.
 - No TLS, and no limit on wrong tokens. A proxy does both.
@@ -622,7 +624,7 @@ The request named the work: a load test against the fixture site, fuzzing of URL
 - The h2 fixture. Four mutants (HTTP/2 forced off, no address check, certificate verification off, no body cap) are each caught by the tests meant to catch them.
 - Load. On this Windows laptop with `WEFT_LOAD_PAGES=5000`, a crawl with 16 workers took 154 seconds (32 pages a second, 43 at 400 pages). Every page was fetched once, with no failure and no duplicate, resident memory grew by 6 MB, the database reached 27 MB, and the server never saw more than two requests in flight. A burst of 5,000 fetches ran at 152 a second. Eight MCP clients over HTTP kept the per-host cap, and `/healthz` answered within about 350 ms. The suite runs the 400-page size by default.
 - Environment. `uv lock --check` passes and the virtual environment is synced to the lock.
-- Not verified. **The workflow has never run and the Docker image has never been built**: this machine has no container runtime and WSL has no distribution. The suite has not run on Linux, so the `SIGTERM` branch of the child-process tests and the Debian package step are untested. The load numbers, the h2 fixture and the timings come from one Windows laptop. The nesting cap is a heuristic with the bypasses its docstring lists.
+- Not verified. **The workflow has never run and the Docker image has never been built**: this machine has no container runtime and WSL has no distribution. The suite has not run on Linux, so the `SIGTERM` branch of the child-process tests and the Debian package step are untested. CI settled those on 2026-11-22: see "CI verified". The load numbers, the h2 fixture and the timings come from one Windows laptop. The nesting cap is a heuristic with the bypasses its docstring lists.
 
 ### Decisions
 
@@ -664,7 +666,7 @@ Fixed:
 
 Accepted and recorded, not fixed:
 
-- The workflow has not run and the image has never been built. The suite has never run on Linux. The first push is the test of all three, and of the `SIGTERM` branch of the child-process tests.
+- The workflow has not run and the image has never been built. The suite has never run on Linux. The first push is the test of all three, and of the `SIGTERM` branch of the child-process tests. CI settled this on 2026-11-22: see "CI verified".
 - The nesting cap is a scan with known bypasses. Extraction threads still cannot be stopped.
 - Extraction takes 30 seconds on a 2 MB page of plain paragraphs and 96 on a 6 MB page of links, and the caller gets `extraction_timeout` first.
 - A robots.txt at the read limit costs 5 to 10 ms per check.
@@ -746,7 +748,7 @@ Changed: the `RUN` and its comment in `Dockerfile`, one test in `tests/test_dock
 - `pytest tests/test_docker.py tests/test_ci.py`: 22 passed, none skipped. I did not run the full suite, because no source file changed.
 - The new test, `test_the_playwright_driver_gets_libatomic_in_the_same_layer`, fails against the old Dockerfile and passes against the new one. Six mutants of the `RUN` each fail it: `libatomic1` after Playwright, no `apt-get update`, no `--no-install-recommends`, no cleanup, cleanup in a second `RUN`, and `libatomic1` in a separate `RUN`. I ran them on scratch copies of the file, and the real Dockerfile was not touched.
 - Processes: the checks started only `pytest` and the Python it spawns for the health check. None is left running.
-- **Not verified: no image was built.** There is no Docker, Podman or Docker Desktop on this machine. The next CI run is the real check. That run also answers whether `libatomic1` is the right package name in Debian bookworm, which I did not look up. The build stopped at this step, so every later step has never run: the browser download, the rest of the Dockerfile, the `test` stage and the three container checks in the workflow. Passing this step does not show it is the last failure.
+- **Not verified: no image was built.** There is no Docker, Podman or Docker Desktop on this machine. The next CI run is the real check. That run also answers whether `libatomic1` is the right package name in Debian bookworm, which I did not look up. The build stopped at this step, so every later step has never run: the browser download, the rest of the Dockerfile, the `test` stage and the three container checks in the workflow. Passing this step does not show it is the last failure. CI settled this on 2026-11-22: see "CI verified". The browser step was the last failure, and the package name was right.
 
 ### Problems hit
 
@@ -769,4 +771,49 @@ a test that pins the order of the four commands and the single layer.
 
 The image has still not been built here, because this machine has no
 container runtime. The next CI run is the check. Docs updated.
+```
+
+## CI verified (2026-11-22)
+
+### Done
+
+The workflow and the image have run. GitHub Actions run 44993289566, on commit da96efa, passed all three jobs: `lint and types`, `tests on Linux` and `image and suite in Docker`. That commit is the libatomic fix from the entry above. This entry changes docs and the README only: a CI status badge for `.github/workflows/ci.yml` at the top of the README, all seven phases marked done in `docs/Phases.md`, and the lines that said the workflow or the image had not run. No source, test, Dockerfile or workflow file changed. Nothing was committed, tagged or pushed.
+
+### Verification
+
+The job logs of the two runs give the counts and times.
+
+- Run 44990615657, the one that failed in the `docker` job on `libatomic.so.1`, also passed `lint and types` and `tests on Linux`. Only `docker` failed. The entry above could say nothing about the other two jobs, and both were green.
+- Run 44993289566, `tests on Linux`: 844 passed, 0 skipped, in 139 seconds. That is the whole suite with real Chromium on Linux. It includes the `SIGTERM` branch of the child-process tests and the POSIX `creationflags` path, which could not run on the Windows build machine.
+- Run 44993289566, `image and suite in Docker`: the `test` stage ran the suite in 143 seconds, 822 passed and 13 skipped. The runtime image then did what the workflow asks of it. It exited with code 2 without a token, turned healthy on `/healthz` with one, answered `401` to `POST /mcp` without a token and stopped on `SIGTERM` without being killed. That container ran with the README's hardening flags: `--init`, `--memory 2g`, `--pids-limit 512`, `--cap-drop ALL`, `--security-opt no-new-privileges` and a named volume on `/data`. Healthy means the server opened its database there as uid 10001.
+- The open questions in the entry above. `libatomic1` is the right package in Debian bookworm, and the browser step was the last failure: the Debian package step, the browser download, the rest of the Dockerfile, the `test` stage and the three container checks all ran.
+- A local `pytest --collect-only` agrees with the log: 844 tests in all, 12 in `tests/test_ci.py` and 10 in `tests/test_docker.py`.
+
+### Why the image's suite shows 822 passed and 13 skipped
+
+The `test` stage copies `tests/` and the installed package, not the repository, so two modules have nothing to read there. `tests/test_ci.py` has 12 tests and needs the workflow file. `tests/test_docker.py` has 10 and needs the Dockerfile. Each test in `test_ci.py` skips. `test_docker.py` skips as a module, which counts as one skip and leaves its other nine tests uncollected. The 13 skips and 9 uncollected tests are those 22, and 822 + 22 = 844, the Linux job's count. All 22 pass in the Linux job, where both files exist. The skip lines in the log give the reasons: "the Dockerfile is not in this tree" and "the workflow file is not in this tree". The 844 is the 843 from the end of Phase 7 plus the libatomic test.
+
+### Still not verified
+
+- Chromium inside the runtime container under the README's flags. The browser tests ran in the `test` stage, which the workflow starts with `--init` and without the capability drop or the memory limit. The runtime container was checked for health, a `401` and a stop, and rendered no page.
+- A hosted connector or a third-party MCP client. The README's client steps follow the common configuration shape and have not been run.
+- The loopback proxies inside a container. That is reasoning, and the workflow does not probe it.
+- Chromium's sandbox being off by default. The claim rests on the documented default and the driver's source. No run showed it.
+- Timings. Each figure is one run on one GitHub runner.
+
+### Commit message draft
+
+```
+Docs: record the CI verification and add a status badge
+
+CI run 44993289566 on da96efa passed all three jobs. Run 44990615657 had
+failed only in the docker job, on a missing libatomic.so.1. Record both in
+the build log with the counts: 844 passed on Linux, and 822 passed with 13
+skipped in the Docker test stage, where test_ci.py and test_docker.py cannot
+read the workflow file or the Dockerfile.
+
+Mark all seven phases done, remove the lines that said the workflow and the
+image had never run, point the older "not verified" notes at the new entry,
+list what is still open, and add a CI status badge for ci.yml to the top of
+the README.
 ```

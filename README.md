@@ -1,5 +1,7 @@
 # Weft
 
+[![CI](https://github.com/TheMEGALODON55681/weft/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/TheMEGALODON55681/weft/actions/workflows/ci.yml)
+
 Weft is a web crawler that AI agents can call. It runs as an MCP server, fetches pages, and returns clean Markdown with the title, metadata, links and the URL each result came from, so the agent can cite its sources.
 
 It also crawls. Give it seed URLs and a goal in plain language ("find pricing pages"), and it follows the links most likely to lead there first, skips duplicates and crawler traps, and ranks what it found against the goal. Crawls run as background jobs that survive a restart. `map_site` lists a site's URLs from its sitemaps without crawling.
