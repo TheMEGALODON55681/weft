@@ -35,8 +35,12 @@ COPY src ./src
 RUN uv sync --frozen --no-editable
 
 # The headless shell Playwright 1.65 drives, with the system libraries it needs. This is the one
-# step that reads the network at build time besides the dependencies above.
-RUN playwright install --with-deps chromium-headless-shell \
+# step that reads the network at build time besides the dependencies above. Playwright's bundled
+# Node links libatomic, which the slim image lacks, so the driver exits 127 before --with-deps can
+# install anything. libatomic1 goes in first, and the apt lists are removed in the same layer.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libatomic1 \
+    && playwright install --with-deps chromium-headless-shell \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 10001 weft \

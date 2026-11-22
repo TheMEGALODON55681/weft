@@ -718,3 +718,55 @@ database size measured, eight HTTP clients served while /healthz answers.
 The workflow has not run and the Docker image was not built, because this
 machine has no container runtime, so neither is verified. Docs updated.
 ```
+
+## CI fix: libatomic in the image (2026-11-22)
+
+### Done
+
+A CI run (44990615657) failed in the `docker` job at the browser step of the Dockerfile, line 39. The log ended with `playwright/driver/node: error while loading shared libraries: libatomic.so.1: cannot open shared object file` and exit code 127. I received that job's failure only, so this log says nothing about `lint` or `test` from that run.
+
+`playwright install` starts the Node binary that ships inside the package, and that binary links `libatomic.so.1`. `python:3.12-slim-bookworm` does not have it. `--with-deps` is a command of the same driver, so it never ran, and the library it would have installed for the driver was the one the driver needed to start.
+
+The browser step is now one `RUN` that installs `libatomic1`, runs Playwright, and removes the apt lists:
+
+```
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libatomic1 \
+    && playwright install --with-deps chromium-headless-shell \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+It stays one layer, so the package lists never reach the image. My `apt-get update` is needed because the slim image ships with empty lists. Playwright runs its own `apt-get update` right after (I read that in the driver bundle, `coreBundle.js`), so the second one repeats the first. The repeat does no harm.
+
+Changed: the `RUN` and its comment in `Dockerfile`, one test in `tests/test_docker.py`, and the lines in `docs/Architecture.md` and `docs/Phases.md` that said the workflow had not run. Nothing under `src/` changed. Nothing was committed, tagged or pushed.
+
+### Verification
+
+- `ruff check .` is clean, `ruff format --check .` finds 88 files formatted, and `mypy` (strict) finds no issues in 44 source files.
+- `pytest tests/test_docker.py tests/test_ci.py`: 22 passed, none skipped. I did not run the full suite, because no source file changed.
+- The new test, `test_the_playwright_driver_gets_libatomic_in_the_same_layer`, fails against the old Dockerfile and passes against the new one. Six mutants of the `RUN` each fail it: `libatomic1` after Playwright, no `apt-get update`, no `--no-install-recommends`, no cleanup, cleanup in a second `RUN`, and `libatomic1` in a separate `RUN`. I ran them on scratch copies of the file, and the real Dockerfile was not touched.
+- Processes: the checks started only `pytest` and the Python it spawns for the health check. None is left running.
+- **Not verified: no image was built.** There is no Docker, Podman or Docker Desktop on this machine. The next CI run is the real check. That run also answers whether `libatomic1` is the right package name in Debian bookworm, which I did not look up. The build stopped at this step, so every later step has never run: the browser download, the rest of the Dockerfile, the `test` stage and the three container checks in the workflow. Passing this step does not show it is the last failure.
+
+### Problems hit
+
+- The existing test did not guard the fix. `test_the_headless_shell_is_installed_with_its_libraries` looks for the install command as a substring, so it passed before the fix and would pass if the fix were dropped. The new test pins the order of the four commands and that they share one `RUN`.
+- My first pattern for reading a multi-line `RUN` captured only its first line. The new test then failed on the old file for two reasons, one of them my own bug. The assertion message showed the command ending in a backslash, which gave it away. The pattern is `^RUN ((?:.*\\\n)*.*)` now.
+
+### Commit message draft
+
+```
+Fix the Docker build: install libatomic1 before Playwright
+
+A CI run failed in the docker job at the browser step. The Node binary
+that Playwright bundles links libatomic.so.1, which
+python:3.12-slim-bookworm does not have, so playwright install exited
+with code 127 before --with-deps could install anything.
+
+Install libatomic1 in the same RUN, ahead of playwright install, and
+remove the apt lists at the end of it so the build stays one layer. Add
+a test that pins the order of the four commands and the single layer.
+
+The image has still not been built here, because this machine has no
+container runtime. The next CI run is the check. Docs updated.
+```

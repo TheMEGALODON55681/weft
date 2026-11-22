@@ -92,6 +92,24 @@ def test_the_headless_shell_is_installed_with_its_libraries() -> None:
     assert "playwright install --with-deps chromium-headless-shell" in stage("base")
 
 
+def test_the_playwright_driver_gets_libatomic_in_the_same_layer() -> None:
+    # The driver is a bundled Node that links libatomic, which the slim image lacks. Without it
+    # `playwright install` exits 127 before --with-deps can install anything, so the package goes
+    # in first. The apt lists are removed in the same RUN, or they stay in the layer.
+    runs = re.findall(r"^RUN ((?:.*\\\n)*.*)", stage("base"), flags=re.MULTILINE)
+    (run,) = [r for r in runs if "playwright install" in r]
+    flat = re.sub(r"\s*\\\n\s*", " ", run)
+    steps = [
+        "apt-get update",
+        "apt-get install -y --no-install-recommends libatomic1",
+        "playwright install --with-deps chromium-headless-shell",
+        "rm -rf /var/lib/apt/lists/*",
+    ]
+    assert all(step in flat for step in steps), flat
+    positions = [flat.index(step) for step in steps]
+    assert positions == sorted(positions), flat
+
+
 def test_the_install_is_exactly_the_lockfile() -> None:
     base = stage("base")
     assert re.findall(r"uv sync (.*)", base) and all(
