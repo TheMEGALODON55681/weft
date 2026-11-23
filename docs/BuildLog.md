@@ -817,3 +817,111 @@ image had never run, point the older "not verified" notes at the new entry,
 list what is still open, and add a CI status badge for ci.yml to the top of
 the README.
 ```
+
+## Phase 8: retrieval quality (2026-11-23)
+
+### Done
+
+A live test from an MCP client (`search_in_site` over `https://docs.python.org/3/library/asyncio.html` for "cancel a task") found three problems, and this phase fixes them. Passages ended in the middle of a sentence. `search_in_site` always started its own crawl and took no URL patterns. Overlapping passages from one section filled the top hits.
+
+Changed: `rank/passages.py` (blocks, reflow, sentence cuts, `diverse`), `retrieval.py` (a stored-only read, `diverse` before the rerank), `server/app.py` (`job_id`, the two pattern lists, `url` optional, `invalid_source`), `frontier/canon.py` (`url_matches`, which `jobs/crawl.py` now calls instead of its own copy of the two loops). New in the fixture: a three-page docs site under `/site/docs`. No setting, dependency, schema or migration changed, and neither did the Dockerfile or the workflow. The suite grew from 844 to 912 tests. Nothing was committed, tagged or pushed.
+
+### Verification
+
+- **Red first.** The tests written before the code were run against the old code and failed for the reason they were written for. Of the 119 passage and canon tests then in place, 28 failed (`diverse` and `url_matches` were do-nothing stubs so that the files could import). Of the 11 server tests, 10 failed on the unchanged tool (an unexpected `job_id`, a `required` list of `url, query`, hits that stopped mid-line). The eleventh checks that the fixture really is hard-wrapped and passed, as it should. A few guard tests passed on the old code (table rows next to a paragraph, a long code block, the hostile-text table), as I expected: they pin behaviour the new parser could have broken. Twelve tests came after the code and were not seen to fail on the old code: the three fuzz properties, and nine unit and server tests (closing marks after a full stop, a year at the start of a wrapped list-item line, inline triple backticks, a number that does not interrupt a paragraph, a fence that never closes, the two- and three-word near-copy boundary, a passage under 30 words, the cap on a job's pages, and the stored read with no cache or no key). I judged those by mutants instead: each was seen to fail against the mutant it was written for.
+- **The suite.** `pytest` ran 904 tests with none failed, in 7 minutes 36 seconds. That run came before the last few tests were added. The last run, after every code and test change, passed all 912 with none failed and none skipped, in 6 minutes 41 seconds.
+- **Lint and types.** `ruff check` is clean, `ruff format --check` finds 88 files formatted, `mypy` in strict mode finds no issues in 44 source files, and `uv lock --check` resolves 102 packages (no dependency changed).
+- **Mutation checks.** 50 hand-written mutants of the Phase 8 code, in six groups: reading blocks (14), sentences and fitting (7), `diverse` (10), the retrieval read (5), the tool (9) and the shared globs (5). The harness copies `src/weft` to a scratch directory, applies one change at a time there, runs pytest with `PYTHONPATH` pointing at the copy and puts the file back. The repository was never written to, and its source hashes are identical before and after (the copy's own line endings changed, since Windows rewrites them, so the copy's hash differs and the repository's does not). Five mutants survived at first: inline triple backticks (a weak test), a number inside a paragraph, a fence that never closes, short passages that got a fingerprint they should not have, and the stored read with no cache. Each got a test. A second run of all 50 caught 48. The last two were then rerun alone after their tests, and both were caught. One of those two had survived only because I had left the server tests out of its run list, so the harness was the fault, and the tests are the new ones in `test_server.py`.
+- **Deep fuzz.** `WEFT_FUZZ_EXAMPLES=10000` drew 10,000 examples from a random seed for each of the three new properties, and all three passed in 69 seconds. The default run also passes them, and mutants show they can fail (see above).
+- **Two real pages.** I fetched `asyncio.html` and `asyncio-task.html` once each through Weft's own fetcher (robots.txt and pacing apply, no browser) and ran the old splitter, loaded from git HEAD, and the new one over the same Markdown. Old: 209 passages, 95 not ending at a sentence or block end (a crude check: last character not `.`, `!`, `?` or `:`, and not a list item or table row). New: 118 passages and 19 flagged by the same check. I read all 19. Two end in a list item, six in a line of code, six in a signature line, one in a paragraph that ends with a call and no full stop, and four are code examples that the extractor had already flattened into one long line, which is cut at a word because it passes 700 characters. None is prose cut in the middle of a sentence. For "cancel a task" the best five hits came from 2 sections before and from 3 after (2, 2 and 1 hits). Only those two pages were looked at, and they have only a few sections that match strongly, so the check says the filter works there and not how it behaves on a whole site.
+- **Processes.** The checks started `pytest`, the Python it spawns for child-process tests, headless Chromium for the browser tests, and the harness. None is left. The four `weft.exe` processes that were running when I started belong to the MCP server attached to this session, and they are still there and still run the old code.
+- **Not verified.** Nothing ran in CI, so the Linux job and the image are unchecked for this phase. The attached MCP server has not been restarted, so no client has called the new tool schema, and the README's `job_id` examples have not been run through a client. The simhash limit comes from one sample of 107 paragraphs of this project's own English docs. A search by `job_id` over 500 pages (the cap) was not timed.
+
+### Decisions
+
+- **Read blocks, not lines.** The splitter used to look at one line at a time, and the extractor's hard wraps made a line end a poor place to cut. A paragraph or list item is now joined into one line before anything is cut, and a passage closes only between blocks. I chose a small block reader over patching the old loop with a "does this line look like it continues" test, which would have had to guess for every line.
+- **Only inline markup keeps the wraps.** My first probe used plain `<p>` text and the extractor joined the lines, so I thought the premise was wrong. With inline `<code>` or links in the paragraph, which is how Sphinx writes nearly every paragraph, the source's line breaks come through. The fixture does the same, and a server test checks that the fixture's Markdown still holds a line break, so the other tests cannot keep passing after the extractor changes.
+- **A full stop before a lowercase word is not a sentence end.** Without it a cut lands after `e.g.`, which is the same fault as before in a smaller place. `!` and `?` always end a sentence, because an old test cuts at them before a lowercase word. There is no abbreviation list, and the README and Phases say what that costs.
+- **A bullet always starts a list item, a number only when it can.** A number starts one when no paragraph is open or when it is 1, as CommonMark has it, and has at most three digits. Otherwise a wrapped line that begins `2023. ` (the year at a line start) would cut the paragraph in the middle of a sentence. Both rules have a test that fails without them.
+- **A hard limit of two hits per section, not a demotion.** Pushing the extra hits to the end of the list would keep recall, since a query whose answer is in one section would still return its passages. But the rerank takes the best 50 and reorders them, so demoted hits could climb back into the top, and the limit would hold only without a rerank. A hard limit holds in both cases and is one line to state. The cost is real: one section's third passage never appears. It is recorded under Left for later in Phases, with the alternative.
+- **Twelve bits for a near copy of a passage, six for a page.** "Reuse the simhash code" meant the functions. The page limit was chosen for pages of hundreds of words. On 107 paragraphs of 30 to 110 words from this project's docs, 6 bits caught 38% of one-word edits, 10 bits 90%, 12 bits all of them and 85% of two-word edits, while the closest of 5,671 pairs of different paragraphs was 18 bits apart. The sample is English technical prose from one project. A passage under 30 words is compared by its words only, as a short page is.
+- **`job_id` reads the cache as stored, however old.** "Without fetching" excludes `get_document`, which revalidates a stale entry with a request. `_stored` asks `PageCache.get` and ignores its `fresh` flag. The cost is that a job from last week returns last week's text, and with the cache off nothing is found. `pages_unreadable` and the README say so. A test makes every row stale and counts the fixture's requests.
+- **Patterns filter every page of a job, the first one included.** A crawl always fetches its seed whatever the patterns say, since there is nothing to discover without it. A filter over finished pages has no such need, and "only the pages under `/guide`" would otherwise return the home page too.
+- **At most 500 pages of a job are searched.** It matches the largest `max_pages` of a new search. The pages come most relevant first, and the filter runs before the cap.
+- **`query` first, `url` optional, a new error code.** Python needs the required parameter before the optional ones, and clients send arguments by name, so the order only shows in the README. `invalid_source` says what is wrong more clearly than `invalid_url` for "both" and "neither".
+- **One `url_matches` for the crawl and the search.** Two copies of "an include must match and an exclude must not" would drift. The crawl's own scope test passes unchanged through it, and a mutant that swaps its two arguments is caught.
+- **Diversify before the rerank, up to 50 hits.** The rerank takes 50 at most. Filtering first means the 50 are already distinct, and `diverse` stops at 50, so the simhash work is bounded and a section's third hit is refused before it is hashed.
+
+### Problems hit
+
+- **The first top-five test passed for the wrong reason.** Its six "strong" paragraphs were one sentence with a number changed. They are near copies of each other, so the filter kept one and the test saw three hits. The filter was right and my data was wrong. The paragraphs are six different statements now.
+- **One survivor taught me a test was too weak.** The test for inline triple backticks had them mid-line, where the mutant could not tell. It starts the line now.
+- **Mutants for a wrapped line that starts with `2.` and for a fence that never closes survived.** Both had code and no test. Each has one now.
+- **A year at the start of a wrapped list-item line.** The three-digit rule and the "number only when no paragraph is open" rule overlap for a paragraph, and the first one matters only inside a list item. A mutant that widened the digits survived until I wrote a test for exactly that.
+- **My editor turned an escape into the character.** `”` in a replacement string became a literal curly quote, and ruff refused the file (RUF001). The closing marks are built with `chr()` now. The Phase 7 notes list the same trap.
+- **Hyphenated wraps in my own fixture.** `textwrap.fill` broke "Re-raise" after the hyphen, which a reflow joins with a space. The fixture turns that off. A real page would do it, and Phases lists it.
+- **The mutation harness crashed once.** The output of a failing test held a curly quote and Windows decoded it with the wrong code page. It reads UTF-8 now, and the run started again from the beginning.
+- **A helper passed `query` to `crawl_site`.** The first run of the `job_id` tests failed on that, not on the missing feature, so I fixed it and checked that the tests then failed for the right reason.
+
+### Review
+
+I reviewed the code in this session from four angles (correctness, security, concurrency, maintainability) and reconciled the findings, then ran an over-engineering review.
+
+Fixed:
+
+- **A pydantic error could pass for "page not stored".** The first `_stored` caught `ValueError` around the whole cache read, and pydantic's `ValidationError` is a `ValueError`. A corrupt row would have vanished as a missing page. It catches only the canonicalisation now.
+- **A redundant slice.** `hits[:RERANK_CANDIDATES]` stayed in `search` after `diverse` started returning at most that many. Removed.
+- **Two weak tests** (see Problems hit).
+- **Over-engineering review.** Kept: a separate `_fit_code` (a long code block cut as prose would lose its newlines), `NEAR_PASSAGE_BITS` as its own constant (the measurement is the reason), the fixture's third page (the pattern tests need two pages that differ by URL), and the hostile-text table (each shape targets a pattern in the new code). Declined with a reason: a setting for the section limit (nobody asked, and it would need a rerank rule), a setext heading or indented code reader (the extractor emits neither on the pages looked at), an abbreviation list (a guess for English only), a deeper near-copy index (the filter looks at 50 hits), and an `age` field on a job search (the `pages` table stores `fetched_at`, but `PageCache.get` does not return it, and nobody asked for it).
+
+Accepted and recorded, not fixed:
+
+- At most two hits come from one section, so one long section's third passage never appears.
+- Sentences are found by punctuation. `Dr. Smith` is cut after `Dr.`.
+- Code that the extractor flattens into one line is cut at words when it passes 700 characters. That is an extraction gap, not a splitter one.
+- A search by `job_id` reads however-old pages and at most 500 of them. Its speed at 500 was not measured.
+- Phase 8 has not run in CI.
+- Carry-overs from Phases 2 to 7 are unchanged.
+
+The jury was again one reviewer playing four roles. The parts most worth an outside read are `_blocks` in `rank/passages.py`, a small state machine whose edge cases came from my own probes, and the choice of 12 bits, which rests on one sample.
+
+### Commit message draft
+
+```
+Phase 8: whole-sentence passages, search by job id, diverse top hits
+
+A live search of a docs site showed three problems with search_in_site.
+
+Passages ended mid-sentence. The extractor keeps the line breaks of a
+source paragraph that has inline markup, and the splitter worked line by
+line, so it closed a passage wherever a line ended. It now reads blocks:
+the lines of a paragraph or list item are joined first, table rows, list
+items and fenced code are blocks of their own, a "#" inside code is not a
+heading, and a passage closes only between blocks. A long block is cut at
+sentence ends, and "e.g." or "etc." does not end one.
+
+search_in_site always started a crawl. It takes an optional job_id and
+searches the pages that job already holds, as the cache stores them, with
+no request and no new job. It also takes include_patterns and
+exclude_patterns, which mean what they mean in crawl_site: with a url they
+steer the new crawl, with a job_id they choose which of the job's pages
+are searched. The crawl and the search share one url_matches. url is now
+optional, query is the only required argument, and giving both or neither
+of url and job_id is the new error invalid_source.
+
+One section could fill the top hits. After ranking, at most two passages
+may come from one heading on one page, and a passage that repeats a better
+one, or is a near copy by simhash within 12 bits, is left out. Both run
+before the rerank. 12 bits comes from a sample of 107 paragraphs: the page
+limit of 6 caught 38% of one-word edits and 12 caught all of them.
+
+Tests were written first and failed on the old code. They cover hard-wrapped
+paragraphs at five widths, abbreviations, list, table and code blocks,
+hostile text, the section limit and near copies, a docs site added to the
+fixture, searches by job id with and without stale or missing cache rows,
+and three fuzz properties. 50 hand-made mutants of the new code are all
+caught.
+
+Not run in CI. The README, Phases, Architecture and the build log are
+updated.
+```

@@ -1,8 +1,12 @@
 import asyncio
 import json
 import math
+import sqlite3
 import sys
+from collections import Counter
+from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -250,7 +254,10 @@ async def test_the_retrieval_tools_are_listed(settings: Settings) -> None:
     async with Client(build_server(settings)) as client:
         tools = {t.name: t for t in await client.list_tools()}
     search, extract = tools["search_in_site"], tools["extract"]
-    assert search.input_schema["required"] == ["url", "query"]
+    assert search.input_schema["required"] == ["query"]  # and one of url or job_id
+    assert {"url", "job_id", "include_patterns", "exclude_patterns"} <= set(
+        search.input_schema["properties"]
+    )
     assert {"max_pages", "limit", "wait_s"} <= set(search.input_schema["properties"])
     assert extract.input_schema["required"] == ["url_or_job", "schema"]
     assert extract.annotations is not None and extract.annotations.read_only_hint is True
@@ -705,3 +712,236 @@ async def test_the_scheme_may_be_upper_case_and_the_target_padded(
             ).structured_content
             assert r is not None and r["source"] == "url"
             assert r["items"][0]["data"] == {"title": "Careers"}
+
+
+# --- Phase 8: retrieval quality -------------------------------------------------------------
+#
+# /site/docs is a three-page docs site whose paragraphs are hard-wrapped in the source: the docs
+# page (a long section "Task.cancel" that is all about the query, and short ones that mention it
+# once), a guide that repeats a note with one word changed, and a news page.
+
+CANCEL = {"query": "cancel a task", "max_pages": 10, "wait_s": 30}
+SENTENCE_END = (".", "!", "?")
+
+
+async def crawl_docs(client: Client[Any], site: FixtureSite) -> str:
+    """Crawl the docs site and return the job's id."""
+    done = await client.call_tool(
+        "crawl_site",
+        {
+            "seed_urls": [site.url("/site/docs")],
+            "goal": "cancel a task",
+            "max_pages": 10,
+            "wait_s": 30,
+        },
+    )
+    assert done.structured_content is not None
+    assert done.structured_content["job"]["status"] == "done"
+    assert done.structured_content["pages_total"] == 3
+    return str(done.structured_content["job"]["id"])
+
+
+async def test_the_docs_fixture_really_is_hard_wrapped(
+    site: FixtureSite, settings: Settings
+) -> None:
+    """The tests below mean nothing if the extractor stops keeping the line breaks."""
+    async with Client(build_server(settings)) as client:
+        page = (
+            await client.call_tool("fetch_page", {"url": site.url("/site/docs")})
+        ).structured_content
+    assert page is not None
+    (first,) = [p for p in page["markdown"].split("\n\n") if p.startswith("To `cancel`")]
+    assert "\n" in first
+
+
+async def test_every_hit_is_whole_sentences_when_the_source_is_hard_wrapped(
+    site: FixtureSite, settings: Settings
+) -> None:
+    async with Client(build_server(settings)) as client:
+        r = (
+            await client.call_tool(
+                "search_in_site", {"url": site.url("/site/docs"), **CANCEL, "limit": 50}
+            )
+        ).structured_content
+    assert r is not None and len(r["hits"]) > 5
+    for h in r["hits"]:
+        assert all(line.endswith(SENTENCE_END) for line in h["passage"].split("\n")), h["passage"]
+        assert not h["passage"].startswith(("`", "(")) and h["passage"][0].isupper(), h["passage"]
+
+
+async def test_the_top_five_hits_come_from_more_than_one_section(
+    site: FixtureSite, settings: Settings
+) -> None:
+    async with Client(build_server(settings)) as client:
+        r = (
+            await client.call_tool(
+                "search_in_site", {"url": site.url("/site/docs"), **CANCEL, "limit": 5}
+            )
+        ).structured_content
+    assert r is not None and len(r["hits"]) == 5
+    sections = Counter((h["url"], h["heading"]) for h in r["hits"])
+    assert len(sections) >= 3 and max(sections.values()) <= 2
+    assert r["hits"][0]["heading"] == "Task.cancel"  # the best section still comes first
+
+
+async def test_a_passage_repeated_with_a_word_changed_is_listed_once(
+    site: FixtureSite, settings: Settings
+) -> None:
+    async with Client(build_server(settings)) as client:
+        r = (
+            await client.call_tool(
+                "search_in_site", {"url": site.url("/site/docs"), **CANCEL, "limit": 50}
+            )
+        ).structured_content
+    assert r is not None
+    noted = [h for h in r["hits"] if "for as long as the task" in h["passage"]]
+    assert len(noted) == 1  # the docs have it and so does the guide, and one is enough
+
+
+async def test_a_search_with_a_job_id_reads_the_stored_pages_and_fetches_nothing(
+    site: FixtureSite, settings: Settings
+) -> None:
+    async with Client(build_server(settings)) as client:
+        job_id = await crawl_docs(client, site)
+        before = site.total_hits
+        r = (
+            await client.call_tool("search_in_site", {"query": "cancel a task", "job_id": job_id})
+        ).structured_content
+        jobs = (await client.call_tool("list_jobs", {})).structured_content
+    assert site.total_hits == before  # not one request, robots.txt included
+    assert jobs is not None and len(jobs["jobs"]) == 1  # and no job of its own
+    assert r is not None and r["job"]["id"] == job_id and r["complete"] is True
+    assert (r["pages_searched"], r["pages_unreadable"]) == (3, 0)
+    assert r["hits"][0]["heading"] == "Task.cancel"
+    assert r["hits"][0]["url"].endswith("/site/docs")
+
+
+async def test_stored_pages_are_searched_even_after_they_have_expired(
+    site: FixtureSite, settings: Settings
+) -> None:
+    async with Client(build_server(settings)) as client:
+        job_id = await crawl_docs(client, site)
+        with closing(sqlite3.connect(settings.db_path, timeout=5)) as db, db:
+            db.execute("UPDATE pages SET expires_at = 0")  # every entry is a long time stale
+        before = site.total_hits
+        r = (
+            await client.call_tool("search_in_site", {"query": "cancel a task", "job_id": job_id})
+        ).structured_content
+    assert site.total_hits == before  # a stale page is read as it was stored, not revalidated
+    assert r is not None and r["pages_searched"] == 3 and r["hits"]
+
+
+async def test_a_job_whose_pages_are_not_stored_has_nothing_to_search(
+    site: FixtureSite, tmp_path: Path
+) -> None:
+    no_cache = Settings(data_dir=tmp_path / "data", cache_ttl_s=0)
+    async with Client(build_server(no_cache)) as client:
+        job_id = await crawl_docs(client, site)
+        before = site.total_hits
+        r = (
+            await client.call_tool("search_in_site", {"query": "cancel a task", "job_id": job_id})
+        ).structured_content
+    assert site.total_hits == before
+    assert r is not None and r["hits"] == []
+    assert (r["pages_searched"], r["pages_unreadable"]) == (0, 3)
+
+
+async def test_a_stored_read_gives_up_without_asking_when_there_is_no_cache_or_no_key() -> None:
+    class NeverAsked:
+        async def get(self, *args: Any) -> None:
+            raise AssertionError("the cache was asked")
+
+    assert await retrieval._stored(SimpleNamespace(cache=None), "http://a.test/", "auto") is None  # type: ignore[arg-type]
+    unnamed = SimpleNamespace(cache=NeverAsked())  # a host with an empty label cannot be a key
+    assert await retrieval._stored(unnamed, "http://a..b/", "auto") is None  # type: ignore[arg-type]
+
+
+async def test_a_job_search_reads_only_the_most_relevant_pages_up_to_its_cap(
+    site: FixtureSite, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("weft.server.app._MAX_SEARCH_PAGES", 2)
+    async with Client(build_server(settings)) as client:
+        job_id = await crawl_docs(client, site)
+        job = (await client.call_tool("get_job", {"job_id": job_id})).structured_content
+        r = (
+            await client.call_tool(
+                "search_in_site", {"query": "cancel a task", "job_id": job_id, "limit": 50}
+            )
+        ).structured_content
+    assert job is not None and r is not None
+    best_two = {p["final_url"] for p in job["pages"][:2]}  # get_job lists them most relevant first
+    assert r["pages_searched"] == 2
+    assert {h["url"] for h in r["hits"]} <= best_two
+
+
+async def test_a_search_names_either_a_url_or_a_job_and_the_job_must_exist(
+    site: FixtureSite, settings: Settings
+) -> None:
+    async with Client(build_server(settings)) as client:
+        job_id = await crawl_docs(client, site)
+        before = site.total_hits
+        with pytest.raises(ToolError, match="unknown_job"):
+            await client.call_tool("search_in_site", {"query": "cancel", "job_id": "nope"})
+        with pytest.raises(ToolError, match="invalid_source"):
+            await client.call_tool(
+                "search_in_site",
+                {"query": "cancel", "job_id": job_id, "url": site.url("/site/docs")},
+            )
+        with pytest.raises(ToolError, match="invalid_source"):
+            await client.call_tool("search_in_site", {"query": "cancel"})
+        with pytest.raises(ToolError, match="invalid_query"):
+            await client.call_tool("search_in_site", {"query": "the of", "job_id": job_id})
+        jobs = (await client.call_tool("list_jobs", {})).structured_content
+    assert site.total_hits == before
+    assert jobs is not None and len(jobs["jobs"]) == 1  # none of the refusals started a crawl
+
+
+async def test_patterns_narrow_the_crawl_a_search_starts(
+    site: FixtureSite, settings: Settings, tmp_path: Path
+) -> None:
+    news = "/site/docs/news"
+    before = site.hits(news)
+    async with Client(build_server(settings)) as client:
+        args = {"url": site.url("/site/docs"), **CANCEL, "limit": 50}
+        narrowed = (
+            await client.call_tool("search_in_site", {**args, "include_patterns": ["*/docs/guide"]})
+        ).structured_content
+        assert site.hits(news) == before  # the crawl never went there
+        excluded = (
+            await client.call_tool("search_in_site", {**args, "exclude_patterns": ["*/news"]})
+        ).structured_content
+    assert site.hits(news) == before
+    assert narrowed is not None and excluded is not None
+    assert narrowed["job"]["params"]["include_patterns"] == ["*/docs/guide"]
+    assert excluded["job"]["params"]["exclude_patterns"] == ["*/news"]
+    for r in (narrowed, excluded):
+        assert r["pages_searched"] == 2
+        assert not any(h["url"].endswith("/news") for h in r["hits"])
+    async with Client(build_server(Settings(data_dir=tmp_path / "b"))) as client:
+        plain = (await client.call_tool("search_in_site", args)).structured_content
+    assert plain is not None and any(h["url"].endswith("/news") for h in plain["hits"])  # control
+
+
+async def test_patterns_choose_which_pages_of_a_job_are_searched(
+    site: FixtureSite, settings: Settings
+) -> None:
+    async with Client(build_server(settings)) as client:
+        job_id = await crawl_docs(client, site)
+        before = site.total_hits
+        base = {"query": "cancel a task", "job_id": job_id, "limit": 50}
+        everything = (await client.call_tool("search_in_site", base)).structured_content
+        no_news = (
+            await client.call_tool("search_in_site", {**base, "exclude_patterns": ["*/news"]})
+        ).structured_content
+        only_guide = (
+            await client.call_tool("search_in_site", {**base, "include_patterns": ["*/guide"]})
+        ).structured_content
+    assert site.total_hits == before
+    assert everything is not None and no_news is not None and only_guide is not None
+    assert everything["pages_searched"] == 3
+    assert any(h["url"].endswith("/news") for h in everything["hits"])
+    assert no_news["pages_searched"] == 2
+    assert not any(h["url"].endswith("/news") for h in no_news["hits"])
+    # Here every page is filtered, the seed included: the patterns pick what is searched.
+    assert only_guide["pages_searched"] == 1
+    assert {h["url"].removeprefix(site.base) for h in only_guide["hits"]} == {"/site/docs/guide"}

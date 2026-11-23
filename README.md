@@ -8,7 +8,7 @@ It also crawls. Give it seed URLs and a goal in plain language ("find pricing pa
 
 It can also answer a question about a site. `search_in_site` crawls toward the question and returns the best passages, each with the URL and a snippet. `extract` pulls structured data out of a page, or out of every page of a crawl, as JSON that validates against a schema you write, using CSS and XPath selectors. Two optional extras, both off by default, rerank search hits by meaning and let a language model read a page when the selectors find too little.
 
-All seven planned phases are built. Eight tools run over stdio, and over streamable HTTP behind a bearer token for remote connectors: `fetch_page`, `crawl_site`, `get_job`, `cancel_job`, `list_jobs`, `map_site`, `search_in_site` and `extract`. A Dockerfile packages the HTTP server, and a GitHub Actions workflow builds the image and runs the tests on Linux. [docs/Phases.md](docs/Phases.md) lists what each phase added and what is still open.
+All seven planned phases are built, and a short eighth fixed three problems in how `search_in_site` picks and cuts its passages. Eight tools run over stdio, and over streamable HTTP behind a bearer token for remote connectors: `fetch_page`, `crawl_site`, `get_job`, `cancel_job`, `list_jobs`, `map_site`, `search_in_site` and `extract`. A Dockerfile packages the HTTP server, and a GitHub Actions workflow builds the image and runs the tests on Linux. [docs/Phases.md](docs/Phases.md) lists what each phase added and what is still open.
 
 ## Install
 
@@ -183,8 +183,9 @@ When a fetch yields nothing usable, the tool returns an error whose message star
 | `extraction_timeout` | Reading the page took longer than `extract_timeout_s`. | No |
 | `render_unavailable` | `render="always"`, and headless Chromium is not installed or would not start. | No |
 | `render_failed` | `render="always"`, and the page crashed the browser tab, for example by passing `browser_js_heap_mb`. | No |
-| `unknown_job` | `get_job`, `cancel_job` or `extract` got an id that no job has. | No |
+| `unknown_job` | `get_job`, `cancel_job`, `extract` or `search_in_site` got an id that no job has. | No |
 | `invalid_query` | `search_in_site` got a query with no searchable word, such as "the of". | No |
+| `invalid_source` | `search_in_site` got both a `url` and a `job_id`, or neither. | After fixing it |
 | `invalid_schema` | `extract` got a schema that is not valid JSON Schema, has a bad selector, points outside itself with `$ref`, or is too large or nested. The message says where. | After fixing it |
 
 ### `crawl_site(seed_urls, goal="", max_pages=50, max_depth=3, include_patterns=[], exclude_patterns=[], same_domain_only=true, render="auto", wait_s=20)`
@@ -252,29 +253,34 @@ Lists a site's URLs without crawling it. Weft reads the `Sitemap:` lines in the 
 
 Only a failure to fetch the start page is an error. Sitemap failures are reported per file.
 
-### `search_in_site(url, query, max_pages=20, limit=10, wait_s=30)`
+### `search_in_site(query, url=null, job_id=null, include_patterns=[], exclude_patterns=[], max_pages=20, limit=10, wait_s=30)`
 
-Crawls a site from a start page, steered by the query, and returns the passages that best answer it. It is `crawl_site` with the query as the goal, followed by a passage search over the pages the crawl kept. Each call starts a job you can read with `get_job`. Pages fetched recently come from the cache, so a repeat search costs few requests.
+Returns the passages of a site that best answer a query. With a `url` it crawls the site from there, steered by the query: it is `crawl_site` with the query as the goal, followed by a passage search over the pages the crawl kept. That call starts a job you can read with `get_job`. With a `job_id` it searches the pages of a crawl that already exists, starts no job and fetches nothing. Pages fetched recently come from the cache, so a repeat search with a `url` costs few requests, and a search with a `job_id` costs none.
 
 | Argument | Meaning |
 | --- | --- |
-| `url` | Where to start, usually the site's home page. Same rules as a `crawl_site` seed. |
 | `query` | What to look for, in plain words, up to 500 characters. It needs at least one searchable word, or the call fails with `invalid_query` before anything is fetched. |
-| `max_pages` | Pages to crawl and search, 1 to 500. |
+| `url` | Where to start a new crawl, usually the site's home page. Same rules as a `crawl_site` seed. |
+| `job_id` | A job from `crawl_site` or an earlier search. Its pages are read from the cache as they were stored, however old, and nothing is fetched or revalidated. A page with no cache entry (the cache is off, or the row was never written) is counted in `pages_unreadable`. At most the job's 500 most relevant pages are searched. Give `url` or `job_id`, not both and not neither: either mistake fails with `invalid_source` before anything starts. An id that no job has fails with `unknown_job`. |
+| `include_patterns` | Glob patterns matched against the full URL, as in `crawl_site`. With a `url`, a discovered link must match one of them, and the start page is fetched whatever they say. With a `job_id`, only the job's pages that match one are searched, the first page included. |
+| `exclude_patterns` | Glob patterns for URLs to skip, as in `crawl_site`. With a `job_id`, the job's pages that match one are not searched. |
+| `max_pages` | Pages to crawl and search, 1 to 500. Ignored with a `job_id`. |
 | `limit` | Passages to return, 1 to 50. |
-| `wait_s` | How long to wait for the crawl, 0 to 300 seconds, with progress notifications. The crawl keeps going after that. |
+| `wait_s` | How long to wait for the crawl, 0 to 300 seconds, with progress notifications. The crawl keeps going after that. Ignored with a `job_id`. |
 
 | Field | Meaning |
 | --- | --- |
-| `hits` | Best first. Each has `url` (the page's final URL: cite it), `title`, `heading` (the nearest heading above the passage), `snippet` (the stretch of the passage around the query words, up to 240 characters), `passage` (the whole passage) and `score`. |
+| `hits` | Best first. Each has `url` (the page's final URL: cite it), `title`, `heading` (the nearest heading above the passage), `snippet` (the stretch of the passage around the query words, up to 240 characters), `passage` (the whole passage) and `score`. At most two come from one section, and a passage that repeats a better one is left out, so there can be fewer than `limit`. |
 | `pages_searched` | Pages read for passages. |
-| `pages_unreadable` | Crawled pages that could not be read again, left out of the search. |
+| `pages_unreadable` | Pages the job lists that could not be read, left out of the search. With a `url`, a page the cache no longer holds and the site no longer serves. With a `job_id`, a page with no cache entry. |
 | `passages_searched` | Passages ranked, after exact repeats were dropped. |
 | `reranked` | `true` when embeddings set the order, see [Optional models](#optional-models). |
-| `complete` | `true` when the crawl finished. If it is `false`, the hits cover the pages read so far: wait for the job with `get_job` and search again, or raise `wait_s`. |
+| `complete` | `true` when the crawl finished. If it is `false`, the hits cover the pages read so far: wait for the job with `get_job` and search again with its `job_id`, or raise `wait_s`. |
 | `job` | The crawl job, as `get_job` returns it. |
 
-**How passages are ranked.** A page's Markdown is cut at headings. Short lines are gathered into passages of about 150 to 700 characters, and long lines are cut at sentence ends. The passages of every page form one corpus, and BM25 ranks them against the query, so a word that fills half the passages counts for little and a rare one for a lot. The page title and the heading count as words of the passage they sit over. A passage with no query word is not a hit. A passage that appears word for word on several pages counts once, at the first. Words are matched in any script that separates them with spaces, and English plurals and `-ing` forms are folded. Chinese, Japanese and Thai are not segmented, and accents are not folded.
+**How passages are made and ranked.** A page's Markdown is read as blocks: headings, paragraphs, list items, table rows and fenced code. A docs generator wraps its paragraphs over several lines in the source, and the extractor keeps those line breaks when a paragraph has inline markup. Weft joins the lines of a paragraph or a list item into one before it cuts anything, so a passage does not end where a line happened to break. Blocks are gathered into passages of about 150 to 700 characters, and a passage closes only between two blocks. Weft cuts a longer block at sentence ends. A full stop before a lowercase word (`e.g. the`, `etc. and`) does not end a sentence. Only a sentence over 700 characters on its own is cut inside. Fenced code is a block: its comments are not headings, and Weft cuts a long one between lines. The passages of every page form one corpus, and BM25 ranks them against the query, so a word that fills half the passages counts for little and a rare one for a lot. The page title and the heading count as words of the passage they sit over. A passage with no query word is not a hit. A passage that appears word for word on several pages counts once, at the first. Words are matched in any script that separates them with spaces, and English plurals and `-ing` forms are folded. Chinese, Japanese and Thai are not segmented, and accents are not folded.
+
+**What keeps one section from filling the list.** The best 50 hits pass through two filters, in rank order, before `limit` is applied and before any rerank. At most two passages may come from one section, which is one heading on one page. And a passage is left out when a better one has the same words, or is a near copy of it, judged by the 64-bit simhash the crawl uses for pages. A passage counts as a near copy within 12 bits, where a page needs 6, because a paragraph moves further than a page when a word changes. A passage of fewer than 30 words is compared by its words only, ignoring case and spacing.
 
 ### `extract(url_or_job, schema, limit=50)`
 
@@ -346,7 +352,7 @@ llm_model = "your-chat-model"
 
 Put keys in the environment (`WEFT_EMBEDDING_API_KEY`, `WEFT_LLM_API_KEY`) rather than the file.
 
-- **Rerank.** With `embedding_rerank` on, `search_in_site` embeds its query and its best 50 keyword hits, and orders them by the keyword rank and the similarity rank together (reciprocal rank fusion), so a strong keyword hit is not pushed out by a vague semantic one. It reorders the keyword hits. It does not find passages that share no word with the query. `score` is then the fused score, and `reranked` is `true`. If the provider fails, the keyword order is returned with `reranked: false`.
+- **Rerank.** With `embedding_rerank` on, `search_in_site` embeds its query and the best 50 keyword hits that get past the section and near-copy filters, and orders them by the keyword rank and the similarity rank together (reciprocal rank fusion), so a strong keyword hit is not pushed out by a vague semantic one. It reorders the keyword hits. It does not find passages that share no word with the query. `score` is then the fused score, and `reranked` is `true`. If the provider fails, the keyword order is returned with `reranked: false`.
 - **Model extraction.** With `llm_extraction` on, `extract` asks the model about a page only when the selectors found too little to satisfy the schema, or the schema has none. The model gets the schema without its selectors, the page URL and the first `llm_max_input_chars` of the page's Markdown, and is told to treat the text as data. Its answer replaces the selectors' only if it validates against the schema. Otherwise the item stays `method: "rules"` and `errors` gains an `llm:` line. A page whose status is 400 or higher is never sent: the rules still run, and the item gets the line `llm: skipped, the page answered with status 404`. One call asks the model about at most 10 pages.
 
 Weft sends nothing to a model unless the flag is on. When it is on, text from the pages you search or extract goes to that endpoint. The endpoint is set here and cannot be chosen by an agent, and it is not checked by the address guard, because an operator who points Weft at a server on their own network means to. A provider error never reaches the agent with a key or a response body in it.
@@ -465,11 +471,14 @@ Each setting has an environment variable named `WEFT_` plus the uppercase settin
 - Near-duplicate detection is tuned for pages of a few hundred words. Pages under 30 words are compared by exact text only.
 - Relevance scores use corpus statistics from the pages a job has fetched. A resumed job starts those statistics again, so scores before and after a restart are not exactly comparable.
 - The page cache is shared by every caller of one server. That is safe while Weft sends no cookies. Authenticated crawls, when they arrive, must keep their pages out of it.
-- Search and extraction read pages back through the cache, so they depend on it. Each `search_in_site` call starts a new crawl job, and jobs are never deleted.
+- Search and extraction read pages back through the cache, so they depend on it. Each `search_in_site` call with a `url` starts a new crawl job, and jobs are never deleted. A search with a `job_id` starts none, but it reads pages however old they are: a job from last week returns last week's text, and with the cache off it finds nothing. Crawl again to refresh it.
 - Search ranks every page of a call in one pass, under `extract_timeout_s`. A search over hundreds of very long pages can exceed it and fail with `extraction_timeout`: lower `max_pages`.
 - `extract` over a job reads its pages one after another, most relevant first, and stops at `limit` matches. On a job of thousands of pages where little matches, the call can take a minute or more. Crawl a smaller job, or call `extract` on the URLs one by one.
 - Reranking only reorders the keyword hits. Passages that share no word with the query are not found, and there is no local embedding model, only the HTTP endpoint.
-- Stemming and stop words are English only. A passage is dropped as a repeat only when the whole passage appears elsewhere word for word.
+- Stemming and stop words are English only. A near copy of a passage is found by simhash, which caught every one-word change and 85% of two-word changes in a test on 107 paragraphs of the project's own docs. A longer rewrite is kept, and so is a copy that is cut at different places on two pages.
+- Some code examples reach Weft already flattened into one long line, and Weft cuts those at a word when they pass 700 characters, since they have no sentence end. On two pages of the Python docs, 4 of 118 passages were like that.
+- A search returns at most two passages from one section. If the whole answer sits in one long section, you get two of its passages, plus the URL and heading to read the rest.
+- Weft finds sentences by punctuation and has no list of abbreviations. It cuts `Dr. Smith` after `Dr.`, and it does not cut before a sentence that opens in lowercase. This matters only inside a block over 700 characters, where a cut has to fall somewhere. A wrapped line that begins with `- ` or `1. ` reads as a list item, as it does in Markdown.
 - A JSON Schema `pattern` or a hostile XPath is run by Weft against page text, and a pathological one can hold one of the four extraction threads until it finishes, as with a page that hangs the extractor.
 - A model's answer is checked against your schema, and that is the only protection from a page that tries to steer it: a page can still put misleading text into a field that accepts any string. Treat extracted data as untrusted page content.
 - The model endpoints are not covered by the address guard and are not chosen by agents. The extraction calls for one `extract` call run one after another, so a slow endpoint can hold the call for up to ten times `provider_timeout_s`.

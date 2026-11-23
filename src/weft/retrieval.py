@@ -13,11 +13,12 @@ from weft.extract.llm import llm_extract
 from weft.extract.schema import DataTooLarge, Extractor
 from weft.fetch.errors import FetchError
 from weft.fetch.page import Document, RenderMode, get_document, off_loop
+from weft.frontier.canon import canonicalize
 from weft.jobs.crawl import CrawlDeps
 from weft.models import ExtractItem, ExtractResult, JobResult, SearchHit, SearchResult
 from weft.obs.logging import safe_url
 from weft.providers import EmbeddingProvider, LlmProvider, ProviderError
-from weft.rank.passages import rank_passages, snippet
+from weft.rank.passages import Hit, diverse, rank_passages, snippet
 from weft.rank.rerank import RERANK_CANDIDATES, rerank
 
 log = logging.getLogger("weft.retrieval")
@@ -39,23 +40,51 @@ async def _document(
         return None
 
 
+async def _stored(deps: CrawlDeps, url: str, render: RenderMode) -> Document | None:
+    """The page as the cache holds it, however old, or None. Nothing is fetched or revalidated."""
+    if deps.cache is None:
+        return None
+    try:
+        key = canonicalize(url)
+    except ValueError:
+        return None
+    entry = await deps.cache.get(key, render)
+    return None if entry is None else Document(entry.result, None)
+
+
 async def search(
     deps: CrawlDeps,
     embedder: EmbeddingProvider | None,
     query: str,
     limit: int,
     result: JobResult,
+    stored_only: bool = False,
 ) -> SearchResult:
-    """The best passages for `query` among the pages `result` lists, with the source of each."""
+    """The best passages for `query` among the pages `result` lists, with the source of each.
+
+    Pages are read through the cache, which fetches a page again if its entry is gone or has
+    expired. With `stored_only` they are read as stored and never fetched, and a page with no
+    entry is counted in `pages_unreadable`."""
     render = result.job.params.render
-    docs = [d for p in result.pages if (d := await _document(deps, p.url, render, False))]
+
+    async def read(url: str) -> Document | None:
+        if stored_only:
+            return await _stored(deps, url, render)
+        return await _document(deps, url, render, False)
+
+    docs = [d for p in result.pages if (d := await read(p.url))]
     corpus = [(d.page.final_url, d.page.title, d.page.markdown) for d in docs]
-    hits, passages = await off_loop(deps.settings, lambda: rank_passages(query, corpus))
+
+    def rank() -> tuple[list[Hit], int]:
+        ranked, searched = rank_passages(query, corpus)
+        # At most RERANK_CANDIDATES, which is also the most the tool returns or reranks.
+        return diverse(ranked, RERANK_CANDIDATES), searched
+
+    hits, passages = await off_loop(deps.settings, rank)
     reranked = False
     if embedder is not None and hits:
         try:
-            # The tool caps `limit` at RERANK_CANDIDATES, so every hit it returns is reranked.
-            hits = await rerank(embedder, query, hits[:RERANK_CANDIDATES])
+            hits = await rerank(embedder, query, hits)
             reranked = True
         except ProviderError as exc:  # the keyword order is still an answer
             log.warning("rerank skipped", extra={"code": exc.code})

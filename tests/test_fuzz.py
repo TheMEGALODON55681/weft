@@ -12,10 +12,12 @@ that many from a random seed (see conftest.py).
 """
 
 import contextlib
+import random
 import re
 import string
 import time
 import zlib
+from collections import Counter
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -34,7 +36,9 @@ from weft.fetch.http import parse_http_url
 from weft.fetch.page import wants_render
 from weft.fetch.robots import Rules, _matches, normalise, parse_robots
 from weft.frontier.canon import canonicalize, pattern, repeats_segments, site_key
+from weft.frontier.dedupe import content_hash
 from weft.frontier.sitemap import _gunzip, parse_sitemap
+from weft.rank.passages import MAX_HITS_PER_SECTION, MAX_PASSAGE_CHARS, Hit, diverse, split_passages
 
 # --- URLs -----------------------------------------------------------------------------------
 
@@ -411,3 +415,59 @@ def test_known_hostile_pages_are_extracted_in_bounded_time(name: str) -> None:
     page = extract_page(cap_nesting(html), "http://example.test/")
     assert time.perf_counter() - start < 10, name
     check_links(page.links)
+
+
+# --- passages -------------------------------------------------------------------------------
+
+MARKDOWN_PIECES = [
+    "word", "words.", "e.g.", "Then", "a", "1", "2023.", "done!", "why?", "(x).", "`code`", "\n",
+    "\n\n", "# ", "## ", "- ", "* ", "1. ", "3) ", "| ", "|", "---", "```", "~~~", " ", "  ", ". ",
+    '."', "x" * 800, "\t", ">", "#",
+]  # fmt: skip
+markdown = st.lists(st.sampled_from(MARKDOWN_PIECES), max_size=80).map("".join)
+PROSE = ["cancel", "a", "task", "the", "event", "loop.", "e.g.", "2023.", "Then", "done!", "why?"]
+PROSE += ["(see", "below).", "x" * 40, "Er.", "ok?"]
+
+
+@given(markdown)
+def test_split_passages_never_raises_and_every_passage_fits(text: str) -> None:
+    for p in split_passages(text):
+        assert 0 < len(p.text) <= MAX_PASSAGE_CHARS
+
+
+@given(
+    st.lists(st.lists(st.sampled_from(PROSE), min_size=1, max_size=120), min_size=1, max_size=4),
+    st.randoms(use_true_random=False),
+)
+def test_where_a_paragraph_is_wrapped_does_not_change_its_passages(
+    paragraphs: list[list[str]], rnd: random.Random
+) -> None:
+    flat = "\n\n".join(" ".join(p) for p in paragraphs)
+    wrapped = "\n\n".join(
+        "".join(w + rnd.choice([" ", "\n"]) for w in p).rstrip() for p in paragraphs
+    )
+    assert split_passages(wrapped) == split_passages(flat)
+
+
+@given(
+    st.lists(
+        st.tuples(
+            st.sampled_from(["u1", "u2"]),
+            st.sampled_from([None, "h1", "h2"]),
+            st.text(alphabet="ab ", max_size=30),
+        ),
+        max_size=30,
+    ),
+    st.integers(0, 12),
+)
+def test_diverse_keeps_a_ranked_subset_with_no_section_over_the_limit(
+    rows: list[tuple[str, str | None, str]], limit: int
+) -> None:
+    hits = [Hit(url, "t", heading, text, 1.0) for url, heading, text in rows]
+    kept = diverse(hits, limit)
+    ranked = iter(hits)
+    assert all(any(k is h for h in ranked) for k in kept)  # in order, taken from the hits
+    assert len(kept) <= limit
+    per_section = Counter((h.url, h.heading) for h in kept)
+    assert all(n <= MAX_HITS_PER_SECTION for n in per_section.values())
+    assert len({content_hash(h.text) for h in kept}) == len(kept)  # no two say the same words

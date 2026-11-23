@@ -8,6 +8,7 @@ bad encodings) stays visible in one place.
 import gzip
 import random
 import ssl
+import textwrap
 import threading
 import time
 from collections import Counter, defaultdict
@@ -384,6 +385,97 @@ for _n, (_title, _pay, _href) in enumerate(_ROLES):
         _para(f"Join the {_title.lower()} team. " + _unique_text(3000 + _n))
         + f'<p>Salary: <span class="salary">${_pay:,}</span> a year.</p>',
     )
+
+
+# A docs site for passage search (Phase 8), reached only from /site/docs. Its paragraphs are
+# written the way a docs generator writes them: wrapped at 72 columns in the source, with inline
+# markup. trafilatura keeps the line breaks that sit next to an element, so the Markdown comes
+# out hard-wrapped, which is what used to cut passages in the middle of a sentence.
+#
+# Six paragraphs of the section "Task.cancel" are about the query "cancel a task" and nothing else
+# is, so a search ranks that one section first six times over. The guide repeats a note from the
+# docs' "Timeouts" with a word changed, and the news page mentions the query once.
+
+
+def _wrapped(text: str) -> str:
+    return f"<p>{textwrap.fill(text, 72, break_on_hyphens=False)}</p>"
+
+
+# Said in the docs under "Timeouts" and again, with one word changed, in the guide.
+_TIMEOUT_NOTE = (
+    "When a timeout fires, the request to cancel is delivered to the task that is waiting, and "
+    "the task must let the error go on up to the timeout block. A task that catches the error "
+    "and carries on makes the timeout fail, so the caller waits for as long as the task chooses "
+    "to keep running."
+)
+
+
+_CANCEL_SECTION = [
+    "To <code>cancel</code> a task, call <code>task.cancel()</code>. The task is not stopped at "
+    "once: the request arrives as a <code>CancelledError</code> at the next await, so a task that "
+    "is busy keeps running until it yields. Cancelling a task that has finished does nothing and "
+    "returns false.",
+    "A task that is asked to cancel may clean up first. Wrap the awaited work in <code>try</code> "
+    "and <code>finally</code> so that files and locks are released when the task is cancelled, "
+    "and let the <code>CancelledError</code> go on up to the caller of the task.",
+    "Do not swallow the error. If a task catches <code>CancelledError</code> and carries on, "
+    "anyone who awaits the task will believe it finished normally, and a request to cancel the "
+    "task has been quietly ignored. Re-raise it after the clean-up.",
+    "You can find out afterwards whether a task was cancelled. The <code>cancelled()</code> "
+    "method returns true once the task has stopped because of a cancel request, and awaiting "
+    "such a task raises the error again in the waiting code.",
+    "To cancel many tasks at once, collect them in a list and call <code>cancel()</code> on "
+    "each one, then gather the list with <code>return_exceptions</code> set, so that one "
+    "cancelled task does not hide the result of the others.",
+    "A cancel request can be given a message. The text passed to <code>cancel()</code> travels "
+    "with the <code>CancelledError</code>, which helps when several parts of a program may "
+    "cancel the same task for different reasons.",
+]
+SITE_PAGES["/site/docs"] = _page(
+    "Cancelling tasks",
+    "<h2>Task.cancel</h2>"
+    + "".join(_wrapped(p) for p in _CANCEL_SECTION)
+    + "<h2>Timeouts</h2>"
+    + _wrapped(
+        "A timeout will <code>cancel</code> the task it guards when the time is up. The block "
+        "is interrupted, and the error is turned into a <code>TimeoutError</code> once the "
+        "block has been left, so the caller sees only the latter."
+    )
+    + _wrapped(_TIMEOUT_NOTE)
+    + "<h2>TaskGroup</h2>"
+    + _wrapped(
+        "A group cancels its other tasks when one of them fails. Each remaining task "
+        "receives the request, and the group waits until every one of them has stopped "
+        "before it raises, so nothing is left running behind the <code>async with</code> "
+        "block."
+    )
+    + "<h2>Shielding</h2>"
+    + _wrapped(
+        "Shielding protects an inner task from a cancel request made to the task that "
+        "awaits it, which is useful for work that must finish, such as writing a record "
+        "to disk with <code>shield()</code>."
+    ),
+    [("/site/docs/guide", "Guide"), ("/site/docs/news", "News")],
+)
+SITE_PAGES["/site/docs/guide"] = _page(
+    "Cancellation guide",
+    "<h2>Handling cancellation</h2>"
+    + _wrapped(_TIMEOUT_NOTE.replace("chooses", "decides"))
+    + _wrapped(
+        "In a long loop, check for a request to cancel the task between units of work and "
+        "stop at a point where the data is consistent, then re-raise the "
+        "<code>CancelledError</code> so the task is marked as cancelled."
+    ),
+)
+SITE_PAGES["/site/docs/news"] = _page(
+    "Release news",
+    "<h2>This month</h2>"
+    + _wrapped(
+        "The dashboard now lets you cancel a task from the list of running work, and the "
+        "export button keeps its place after a refresh. The mobile layout is tidier too, "
+        "with <code>wider</code> buttons for touch screens."
+    ),
+)
 
 
 LOAD_FANOUT = 5

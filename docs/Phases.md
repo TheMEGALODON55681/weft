@@ -11,8 +11,9 @@ Build order is fixed. Each phase is finished, tested and documented before the n
 | 5 | Retrieval: passage ranking, `search_in_site`, schema `extract`, optional rerank and model extraction | Done |
 | 6 | Remote: streamable HTTP transport, bearer auth, Docker, `/healthz` | Done |
 | 7 | Hardening: load test, fuzzing, HTTP/2 test, docs polish | Done |
+| 8 | Retrieval quality: whole-sentence passages, search by job id with URL patterns, no section filling the top hits | Done, not yet run in CI |
 
-All seven phases are done and checked in CI. Run 44993289566, on commit da96efa, passed lint, the suite on Linux (844 tests) and the Docker image with the suite run inside it. Phases 6 and 7 below record what that run settled and what is still open. BuildLog has the details under "CI verified".
+All seven planned phases are done and checked in CI. Run 44993289566, on commit da96efa, passed lint, the suite on Linux (844 tests) and the Docker image with the suite run inside it. Phases 6 and 7 below record what that run settled and what is still open. BuildLog has the details under "CI verified". Phase 8 came after, from a live test of `search_in_site`, and has not run in CI.
 
 ## Phase 1: done
 
@@ -135,8 +136,8 @@ Left for later:
 - No local embedding model, only the HTTP endpoint. A `sentence-transformers` provider would fit behind the same interface, at the price of a large dependency.
 - Rerank orders the keyword hits and does not add recall. Passages that share no word with the query are not found.
 - Stemming and stop words are English only. Chinese, Japanese and Thai are not segmented. Accents are not folded.
-- A passage is dropped as a repeat only when the whole passage repeats. Boilerplate that differs by a word is kept.
-- Each `search_in_site` call starts a job and jobs are never deleted. Search with the cache off fetches every page twice, and with `cache_ttl_s = 0` extraction over a job fetches every page again.
+- A passage is dropped as a repeat only when the whole passage repeats. Boilerplate that differs by a word is kept. Closed for the hits in Phase 8: a hit that is a near copy of a better one is left out. `passages_searched` still counts the copies.
+- Each `search_in_site` call starts a job and jobs are never deleted. Search with the cache off fetches every page twice, and with `cache_ttl_s = 0` extraction over a job fetches every page again. Phase 8 lets a search name an existing job, which starts none, but it does not delete anything, and a `url` search still starts one.
 - The `pages` table is about ten times larger and is never swept.
 - Ranking a very large search happens in one pass under `extract_timeout_s`.
 - Agent-supplied XPath and JSON Schema `pattern` values can hold one of the four extraction threads, the same ceiling as Phase 2.
@@ -202,3 +203,26 @@ Left for later:
 - Chromium has not been started inside the runtime container under the README's flags. The workflow starts that container with `--cap-drop ALL`, `--memory 2g` and the other flags and checks the health endpoint, the `401` and the stop. The browser tests ran in the `test` stage, which it starts without those flags. Fetch a page with `render="always"` from the image, run as the README says, before relying on rendering there.
 - Crawl throughput fell from 43 to 32 pages a second between 400 and 5,000 pages. Where the time goes is not known.
 - Carry-overs from Phases 2 to 6 that this section does not name are unchanged: limits per host name, one token and no caller identity, no cap on queued jobs, the shared page cache, `Cache-Control: no-store`, sitemaps with namespace prefixes, `same_domain_only` and `www.`, two servers on one data directory, English-only stemming, and the rest of the lists above.
+
+## Phase 8: retrieval quality, done, not yet run in CI
+
+A live test from an MCP client (`search_in_site` over `https://docs.python.org/3/library/asyncio.html` for "cancel a task") found three problems. This phase fixes them, with tests that were written first and seen to fail.
+
+Delivered:
+
+- **Passages end at the end of a sentence or a block.** Weft reads the Markdown as blocks instead of lines. The lines of a paragraph or list item are joined first, so the hard wraps that the extractor keeps in docs-style source no longer decide where a passage closes. Table rows, list items and fenced code are blocks of their own, a `#` inside code is not a heading, and a passage closes only between blocks. A long block is cut at sentence ends, and `e.g.`, `i.e.` and `etc.` do not end a sentence. See "Passage splitting" in Architecture. The cause was confirmed first: markup with inline code or links, wrapped at 72 columns, comes out of the extractor with its line breaks, and plain paragraphs do not.
+- **`search_in_site` can search a job, and takes URL patterns.** `job_id` searches the pages of an existing crawl as the cache holds them and fetches nothing, however old they are. `include_patterns` and `exclude_patterns` mean what they mean in `crawl_site` (one shared function, `url_matches`, which the crawl now uses too). With a `url` they steer the new crawl. With a `job_id` they choose which of the job's pages are searched. `url` is now optional and `query` is the only required argument, so exactly one of `url` and `job_id` is checked, and anything else is the new error `invalid_source`.
+- **No section fills the top hits.** After ranking, at most two passages may come from one section (a heading on one page), and a passage is left out when a better one has the same words or is a near copy of it. The near copy test reuses the page simhash code with a limit of 12 bits for a passage in place of 6 for a page, measured on 107 paragraphs of the project's docs: 6 bits caught 38% of one-word edits and 12 caught all, with the closest pair of unrelated paragraphs 18 bits apart. Both filters run before the rerank, so it cannot undo them.
+- Tests, mutants, lint and types: see BuildLog.
+
+Left for later:
+
+- The section limit is fixed at two and is not a setting. A question whose whole answer is in one long section gets two passages, and the agent has to read the page for the rest. A softer rule (fill the empty places with the extra hits from that section) would give more text, and it would also let the same section back in after a rerank.
+- Sentences are found by punctuation, with no list of abbreviations. `Dr. Smith` is cut after `Dr.`, and a sentence that opens in lowercase follows a full stop with no cut. Both matter only inside a block over 700 characters. A sentence over 700 characters on its own is still cut at a word.
+- A wrapped line that begins with `- ` or `1. ` reads as a list item, as in Markdown, so it starts a new unit in the middle of a sentence. A word that a hyphen splits across two lines (`re-` and `raise`) is joined with a space and not put back together.
+- Code examples that the extractor has already flattened into one long line (this happens to some Sphinx examples) are cut at a word when they pass 700 characters, because they hold no sentence end. On two pages of the Python docs, 4 of 118 passages were like that. A fix belongs in extraction.
+- A search by `job_id` reads at most the job's 500 most relevant pages, and reads them as stored, so a job from last week gives last week's text. `pages_unreadable` is the only sign of a page that was missing, and nothing says how old the pages are.
+- Near copies are found by simhash: all one-word edits and 85% of two-word edits in the sample, fewer for passages of 30 to 40 words, and none of a rewrite. `passages_searched` still counts the copies.
+- Block parsing does not know setext headings (underlined with `===`), indented code or blockquote markers. The two sample pages I probed contained none of them: the extractor drops quote markers and fences code. Other pages may differ.
+- Phase 8 has not run in CI. The Linux job and the Docker job are the next check, and the first run on a push will say.
+- Carry-overs from Phases 2 to 7 that this section does not name are unchanged.

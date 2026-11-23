@@ -16,7 +16,6 @@ import logging
 import sqlite3
 import time
 from dataclasses import dataclass, replace
-from fnmatch import fnmatchcase
 from urllib.parse import urlsplit
 
 from weft.config import Settings
@@ -26,7 +25,7 @@ from weft.fetch.cache import PageCache
 from weft.fetch.errors import FetchError
 from weft.fetch.http import Fetcher
 from weft.fetch.page import get_page
-from weft.frontier.canon import canonicalize, pattern, repeats_segments, site_key
+from weft.frontier.canon import canonicalize, pattern, repeats_segments, site_key, url_matches
 from weft.frontier.dedupe import (
     MIN_WORDS,
     NEAR_BITS,
@@ -161,11 +160,7 @@ class Crawl:
             return False
         if self._p.same_domain_only and site_key(_host(url)) not in self._sites:
             return False
-        if self._p.include_patterns and not any(
-            fnmatchcase(url, pat) for pat in self._p.include_patterns
-        ):
-            return False
-        return not any(fnmatchcase(url, pat) for pat in self._p.exclude_patterns)
+        return url_matches(url, self._p.include_patterns, self._p.exclude_patterns)
 
     async def _process(self, item: Item) -> None:
         d = self._deps

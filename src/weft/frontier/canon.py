@@ -9,6 +9,7 @@ server returns.
 
 import ipaddress
 import re
+from fnmatch import fnmatchcase
 from urllib.parse import quote, urlsplit, urlunsplit
 
 # Parameters that only say where a click came from. Keys are compared in lower case.
@@ -114,6 +115,15 @@ def pattern(url: str) -> str:
     parts = urlsplit(url)
     keys = sorted({p.partition("=")[0] for p in parts.query.split("&") if p})
     return f"{parts.netloc}{_DIGITS.sub('N', parts.path)}?{'&'.join(keys)}"
+
+
+def url_matches(url: str, include: list[str], exclude: list[str]) -> bool:
+    """Whether a URL passes the glob patterns of a crawl or a search: it must match one of
+    `include` when there are any, and none of `exclude`. Patterns are case-sensitive and run over
+    the whole URL, query string included."""
+    if include and not any(fnmatchcase(url, pat) for pat in include):
+        return False
+    return not any(fnmatchcase(url, pat) for pat in exclude)
 
 
 def repeats_segments(url: str, limit: int = 2) -> bool:

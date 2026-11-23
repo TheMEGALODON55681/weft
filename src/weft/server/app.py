@@ -23,7 +23,7 @@ from weft.fetch.cache import PageCache
 from weft.fetch.errors import FetchError
 from weft.fetch.http import Fetcher, parse_http_url
 from weft.fetch.page import RenderMode, get_page
-from weft.frontier.canon import canonicalize
+from weft.frontier.canon import canonicalize, url_matches
 from weft.frontier.sitemap import map_site as build_site_map
 from weft.jobs.crawl import CrawlDeps
 from weft.jobs.manager import JobManager
@@ -57,6 +57,10 @@ INSTRUCTIONS = (
 
 # The largest job extract reads. It is crawl_site's own cap on max_pages.
 _MAX_JOB_PAGES = 5000
+
+# The most pages one search reads for passages: its own cap on max_pages, and the most it takes
+# from a job when it is given a job_id.
+_MAX_SEARCH_PAGES = 500
 
 # How often crawl_site reports progress while it waits for its job.
 _PROGRESS_EVERY_S = 1.0
@@ -349,9 +353,6 @@ def build_server(
 
     @mcp.tool(annotations={"readOnlyHint": False, "openWorldHint": True})
     async def search_in_site(
-        url: Annotated[
-            str, Field(description="Where to start: any page on the site, usually its home page.")
-        ],
         query: Annotated[
             str,
             Field(
@@ -360,8 +361,52 @@ def build_server(
                 description="What to look for, in plain words, e.g. 'annual plan refunds'.",
             ),
         ],
+        url: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Starts a new crawl here: any page on the site, usually its home page. "
+                    "Give this or job_id, not both."
+                )
+            ),
+        ] = None,
+        job_id: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Searches the pages an existing crawl job (from crawl_site or an earlier "
+                    "search) already holds, and fetches nothing. Give this or url, not both."
+                )
+            ),
+        ] = None,
+        include_patterns: Annotated[
+            list[Pattern] | None,
+            Field(
+                max_length=50,
+                description=(
+                    "Glob patterns over the full URL, e.g. '*/docs/*', as in crawl_site. With "
+                    "url, a discovered link must match one. With job_id, only the job's pages "
+                    "that match one are searched, the first page included."
+                ),
+            ),
+        ] = None,
+        exclude_patterns: Annotated[
+            list[Pattern] | None,
+            Field(
+                max_length=50,
+                description=(
+                    "Glob patterns over the full URL to skip, as in crawl_site. With job_id, "
+                    "the job's pages that match one are not searched."
+                ),
+            ),
+        ] = None,
         max_pages: Annotated[
-            int, Field(ge=1, le=500, description="Pages to crawl and search.")
+            int,
+            Field(
+                ge=1,
+                le=_MAX_SEARCH_PAGES,
+                description="Pages to crawl and search. Ignored with job_id.",
+            ),
         ] = 20,
         limit: Annotated[
             int, Field(ge=1, le=RERANK_CANDIDATES, description="Passages to return.")
@@ -373,28 +418,54 @@ def build_server(
                 le=300,
                 description=(
                     "Seconds to wait for the crawl, reporting progress. The crawl keeps going "
-                    "after that, and the passages found so far are returned with complete=false."
+                    "after that, and the passages found so far are returned with complete=false. "
+                    "Ignored with job_id."
                 ),
             ),
         ] = 30,
         ctx: Context = CurrentContext(),
     ) -> SearchResult:
-        """Crawl a site from a start page, steered by the query, and return the passages that
-        best answer it. Each hit has the URL to cite, the page title, the heading it sits under,
-        a snippet around the matching words and the full passage, best first. Pages crawled
-        recently are read from the cache, so a repeat search costs few requests. The same
-        politeness rules as crawl_site apply, and each call starts a crawl job you can read
-        with get_job. If the crawl did not finish in time (`complete` is false), the hits cover
-        only the pages read so far: call get_job to see when it is done, then search again, or
-        raise wait_s."""
+        """Search a site for the passages that best answer a query. With `url`, crawl the site
+        from that page, steered by the query. With `job_id`, search the pages an existing crawl
+        holds, as they were stored, with no new crawl and no fetching. Each hit has the URL to
+        cite, the page title, the heading it sits under, a snippet around the matching words
+        and the full passage, best first. A passage ends at the end of a sentence or a block,
+        at most two come from one section, and a passage that repeats a better one is left out,
+        so there may be fewer hits than `limit`. Pages crawled recently are read from the
+        cache, so a repeat search costs few requests. The same politeness rules as crawl_site
+        apply, and a search with `url` starts a crawl job you can read with get_job. If the
+        crawl did not finish in time (`complete` is false), the hits cover only the pages read
+        so far: call get_job to see when it is done, then search again with job_id, or raise
+        wait_s. A job's 500 most relevant pages are searched at most."""
         state: AppState = ctx.lifespan_context["state"]
-        _check_url(url)
         if not terms(query):
             raise ToolError("invalid_query: the query has no searchable words")
-        params = CrawlParams(seed_urls=[url], goal=query, max_pages=max_pages)
-        result = await _crawl(state, ctx, params, wait_s, limit=max_pages)
+        include, exclude = include_patterns or [], exclude_patterns or []
+        if job_id is not None and url is None:
+            held = await state.jobs.result(job_id, limit=_MAX_JOB_PAGES, offset=0)
+            if held is None:
+                raise ToolError(f"unknown_job: no job {job_id!r}")
+            pages = [p for p in held.pages if url_matches(p.url, include, exclude)]
+            result = held.model_copy(update={"pages": pages[:_MAX_SEARCH_PAGES]})
+        elif url is not None and job_id is None:
+            _check_url(url)
+            params = CrawlParams(
+                seed_urls=[url],
+                goal=query,
+                max_pages=max_pages,
+                include_patterns=include,
+                exclude_patterns=exclude,
+            )
+            result = await _crawl(state, ctx, params, wait_s, limit=max_pages)
+        else:
+            raise ToolError(
+                "invalid_source: give url to crawl a site, or job_id to search a crawl that "
+                "exists, and not both"
+            )
         try:
-            return await search(state.deps, state.embedder, query, limit, result)
+            return await search(
+                state.deps, state.embedder, query, limit, result, stored_only=job_id is not None
+            )
         except FetchError as exc:  # extraction_timeout
             raise _tool_error(exc) from exc
 

@@ -1,6 +1,6 @@
 import pytest
 
-from weft.frontier.canon import canonicalize, pattern, repeats_segments, site_key
+from weft.frontier.canon import canonicalize, pattern, repeats_segments, site_key, url_matches
 
 
 @pytest.mark.parametrize(
@@ -110,3 +110,23 @@ def test_repeated_segments_are_spotted() -> None:
     assert repeats_segments("http://a.test/x/y/x/y/x/y")
     assert not repeats_segments("http://a.test/x/y/x/y")
     assert not repeats_segments("http://a.test/2026/11/21")
+
+
+@pytest.mark.parametrize(
+    ("url", "include", "exclude", "expected"),
+    [
+        ("http://a.test/docs/x", [], [], True),
+        ("http://a.test/docs/x", ["*/docs/*"], [], True),
+        ("http://a.test/blog/x", ["*/docs/*"], [], False),
+        ("http://a.test/docs/x", ["*/blog/*", "*/docs/*"], [], True),  # any one include will do
+        ("http://a.test/docs/x", [], ["*/docs/*"], False),
+        ("http://a.test/docs/old", ["*/docs/*"], ["*/old"], False),  # an exclude beats an include
+        ("http://a.test/docs/x", [], ["*/blog/*", "*/old"], True),
+        ("http://a.test/DOCS/x", ["*/docs/*"], [], False),  # patterns are case-sensitive
+        ("http://a.test/docs/x?v=2", ["*/docs/x"], [], False),  # over the whole URL, query too
+    ],
+)
+def test_include_and_exclude_globs_decide_whether_a_url_is_wanted(
+    url: str, include: list[str], exclude: list[str], expected: bool
+) -> None:
+    assert url_matches(url, include, exclude) is expected
