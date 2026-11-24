@@ -11,9 +11,9 @@ Build order is fixed. Each phase is finished, tested and documented before the n
 | 5 | Retrieval: passage ranking, `search_in_site`, schema `extract`, optional rerank and model extraction | Done |
 | 6 | Remote: streamable HTTP transport, bearer auth, Docker, `/healthz` | Done |
 | 7 | Hardening: load test, fuzzing, HTTP/2 test, docs polish | Done |
-| 8 | Retrieval quality: whole-sentence passages, search by job id with URL patterns, no section filling the top hits | Done, not yet run in CI |
+| 8 | Retrieval quality: whole-sentence passages, search by job id with URL patterns, no section filling the top hits | Done |
 
-All seven planned phases are done and checked in CI. Run 44993289566, on commit da96efa, passed lint, the suite on Linux (844 tests) and the Docker image with the suite run inside it. Phases 6 and 7 below record what that run settled and what is still open. BuildLog has the details under "CI verified". Phase 8 came after, from a live test of `search_in_site`, and has not run in CI.
+All eight phases are done and checked in CI. Run 44993289566, on commit da96efa, passed lint, the suite on Linux (844 tests) and the Docker image with the suite run inside it. Phases 6 and 7 below record what that run settled and what is still open. BuildLog has the details under "CI verified". Phase 8 came after, from a live test of `search_in_site`, and run 45196313675, on commit a72f9a2, passed all three jobs with it.
 
 ## Phase 1: done
 
@@ -204,7 +204,7 @@ Left for later:
 - Crawl throughput fell from 43 to 32 pages a second between 400 and 5,000 pages. Where the time goes is not known.
 - Carry-overs from Phases 2 to 6 that this section does not name are unchanged: limits per host name, one token and no caller identity, no cap on queued jobs, the shared page cache, `Cache-Control: no-store`, sitemaps with namespace prefixes, `same_domain_only` and `www.`, two servers on one data directory, English-only stemming, and the rest of the lists above.
 
-## Phase 8: retrieval quality, done, not yet run in CI
+## Phase 8: retrieval quality, done
 
 A live test from an MCP client (`search_in_site` over `https://docs.python.org/3/library/asyncio.html` for "cancel a task") found three problems. This phase fixes them, with tests that were written first and seen to fail.
 
@@ -224,5 +224,5 @@ Left for later:
 - A search by `job_id` reads at most the job's 500 most relevant pages, and reads them as stored, so a job from last week gives last week's text. `pages_unreadable` is the only sign of a page that was missing, and nothing says how old the pages are.
 - Near copies are found by simhash: all one-word edits and 85% of two-word edits in the sample, fewer for passages of 30 to 40 words, and none of a rewrite. `passages_searched` still counts the copies.
 - Block parsing does not know setext headings (underlined with `===`), indented code or blockquote markers. The two sample pages I probed contained none of them: the extractor drops quote markers and fences code. Other pages may differ.
-- Phase 8 has not run in CI. The Linux job and the Docker job are the next check, and the first run on a push will say.
+- Phase 8 ran in CI after it was committed: run 45196313675, on commit a72f9a2, passed all three jobs.
 - Carry-overs from Phases 2 to 7 that this section does not name are unchanged.

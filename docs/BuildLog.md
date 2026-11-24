@@ -925,3 +925,11 @@ caught.
 Not run in CI. The README, Phases, Architecture and the build log are
 updated.
 ```
+
+## README rewrite and the Phase 8 CI run (2026-11-24)
+
+- **Phase 8 in CI.** Run 45196313675, on commit a72f9a2, passed all three jobs. `pytest --collect-only` on commit ff828e4 collects 912 tests.
+- **README.** Rewritten around a live session with the Weft server attached to an MCP client: a goal-directed crawl of the Python asyncio docs, a search over that crawl's pages, a schema extraction and a set of refused requests. The images in `docs/assets/` are captures of that real output. `demo.gif` replays the session with the timing compressed, and `gauntlet.gif` animates three real `fetch_page` results through the six checks. The architecture diagram has a light and a dark version.
+- **Reference.** The README's full reference (tool fields, error codes, settings, safety rules, limits and development notes) moved unchanged to `docs/Reference.md`.
+- **License.** `LICENSE` added, MIT.
+- **Docs.** `docs/Phases.md` no longer says Phase 8 has not run in CI.
