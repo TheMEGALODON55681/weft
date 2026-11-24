@@ -10,6 +10,7 @@
   <a href="#getting-started">Get started</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#safety">Safety</a> ·
+  <a href="#by-the-numbers">Numbers</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#design-decisions">Design decisions</a> ·
   <a href="#limitations">Limitations</a> ·
@@ -94,12 +95,83 @@ An agent picks up URLs from pages anyone can write, so Weft treats every URL as 
 
 Politeness has no off switch either. robots.txt is obeyed on every hop with `Crawl-delay`, requests to one host are spaced and capped, and a failing host is left alone by a circuit breaker. Stealth scraping, CAPTCHA solving and fingerprint evasion are out of scope. The [safety rules in full](docs/Reference.md#safety-and-politeness) list every range and limit.
 
+## By the numbers
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/numbers-dark.png">
+  <img alt="Left: tests at the end of each phase, rising from 96 after Phase 1 to 912 after Phase 8. Right: a load test of 5,000 pages with 16 workers: 154 seconds, 0 failed pages and 0 pages fetched twice, 6 MB more resident memory, a 27 MB database, a burst of 5,000 single fetches at 152 a second, and /healthz answering in about 350 ms under eight MCP clients over HTTP." src="docs/assets/numbers-light.png">
+</picture>
+
 ## Architecture
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.png">
   <img alt="Request path through Weft: an MCP client over stdio or streamable HTTP, eight tools, the engine (best-first frontier, dedupe and trap guards, resumable jobs, retrieval), six checks on every fetch, plain HTTP or headless Chromium behind a guarded proxy, and SQLite storage." src="docs/assets/architecture-light.png">
 </picture>
+
+### How the parts connect
+
+Every path to the network ends at the same address guard, including the browser's.
+
+```mermaid
+flowchart TB
+    A["Agent or MCP client"] -->|stdio| S
+    A -->|"streamable HTTP, bearer token"| S
+    subgraph W["Weft, one process"]
+        S["MCP server, eight tools"] --> M["Job manager"]
+        M --> C["Crawl workers"]
+        C <--> F["Frontier: best-first, dedupe, trap limits"]
+        S --> R["Retrieval: BM25 passages, schema extraction"]
+        C --> P["Page pipeline: cache, fetch, decode, extract"]
+        R --> P
+        P --> H["Fetcher: robots.txt, breaker, pacing, retries"]
+        P -. "JavaScript shells only" .-> B["Headless Chromium"]
+        B -->|navigations| H
+        B -->|"everything else"| X["Guarded proxy"]
+        H --> G{{"Address guard"}}
+        X --> G
+        F --- D[("SQLite in WAL mode: jobs, frontier, page cache")]
+        M --- D
+        P --- D
+    end
+    G -->|"checked addresses only"| N(("The web"))
+    classDef core fill:#312e81,stroke:#818cf8,color:#ffffff
+    classDef guard fill:#14532d,stroke:#4ade80,color:#ffffff
+    classDef store fill:#7c2d12,stroke:#fb923c,color:#ffffff
+    classDef web fill:#1e3a5f,stroke:#60a5fa,color:#ffffff
+    class S,R core
+    class H,X,G guard
+    class D store
+    class N web
+```
+
+### A crawl, then a search
+
+The order of calls in the live session above.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent
+    participant W as Weft
+    participant G as Fetcher and address guard
+    participant S as Site
+    A->>W: crawl_site(seed, goal)
+    loop best first, until max_pages or the time budget
+        W->>G: next URL from the frontier
+        G->>S: robots.txt, once per origin
+        G->>S: GET the page, paced, to a checked address
+        S-->>G: HTML
+        G-->>W: Markdown and links
+        W->>W: score links against the goal, skip duplicates, commit the step
+    end
+    W-->>A: job id, most relevant pages first
+    A->>W: search_in_site(job_id, query)
+    W->>W: read the job's pages from the cache, cut passages, rank with BM25, two per section
+    W-->>A: passages with URL, heading and snippet
+```
+
+### Where the code lives
 
 ```text
 src/weft/

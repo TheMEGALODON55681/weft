@@ -933,3 +933,4 @@ updated.
 - **Reference.** The README's full reference (tool fields, error codes, settings, safety rules, limits and development notes) moved unchanged to `docs/Reference.md`.
 - **License.** `LICENSE` added, MIT.
 - **Docs.** `docs/Phases.md` no longer says Phase 8 has not run in CI.
+- **More README visuals.** Two Mermaid diagrams (how the parts connect, and the calls of a crawl followed by a search), a "By the numbers" figure with the test count per phase from `docs/Phases.md` and the Phase 7 load-test figures, and smoother 25 fps versions of both animations.
